@@ -1,8 +1,47 @@
+import os
+import time
+
 import speech_recognition as sr
+from groq import Groq
+
 from core.config import CFG
 
 _r = sr.Recognizer()
 _r.pause_threshold = 0.8
+_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+_V = CFG["voice"]
+_LANG = _V.get("stt_language", "en-US").split("-")[0]          # "en-US" -> "en"
+_MODELS = _V.get("stt_models", ["whisper-large-v3-turbo", "whisper-large-v3"])
+_WORDS = (["Iris", "Chrome", "Notepad", "YouTube", "Gmail", "LinkedIn", "Google",
+           "screenshot", "reminder", "explorer", "calculator"]
+          + list(CFG.get("chrome", {}).get("profiles", {}))[:20])
+_HINT = "Voice commands for a PC assistant named Iris: " + ", ".join(_WORDS) + "."
+_JUNK = {"you", "thanks for watching", "thank you for watching"}
+
+
+def _whisper(audio):
+    """Returns the text, or None if the service failed."""
+    wav = audio.get_wav_data(convert_rate=16000, convert_width=2)
+    for model in _MODELS:
+        try:
+            r = _client.audio.transcriptions.create(
+                file=("speech.wav", wav), model=model, language=_LANG,
+                prompt=_HINT, temperature=0.0)
+            return (getattr(r, "text", "") or "").strip()
+        except Exception as e:
+            print(f"[stt] {model} failed: {e}")
+    return None
+
+
+def _google(audio):
+    try:
+        return _r.recognize_google(audio, language=_V.get("stt_language", "en-US"))
+    except sr.UnknownValueError:
+        return ""
+    except sr.RequestError as e:
+        print("[stt] google error:", e)
+        return ""
 
 
 def listen(timeout=8, phrase_limit=12):
@@ -17,11 +56,18 @@ def listen(timeout=8, phrase_limit=12):
     except OSError as e:
         print("[mic error]", e)
         return ""
-    try:
-        return _r.recognize_google(audio, language=CFG["voice"]["stt_language"])
-    except sr.UnknownValueError:
-        print("[mic] heard sound but could not understand it")
+
+    seconds = len(audio.frame_data) / (audio.sample_rate * audio.sample_width)
+    if seconds < 0.4:
+        print("[mic] too short, ignored")
         return ""
-    except sr.RequestError as e:
-        print("[mic] speech service error:", e)
+
+    t0 = time.time()
+    text = _whisper(audio)
+    if text is None:
+        print("[stt] using Google fallback")
+        text = _google(audio)
+    print(f"[stt] {time.time() - t0:.1f}s")
+    if text.lower().strip(" .!?") in _JUNK:
         return ""
+    return text
