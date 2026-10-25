@@ -1,13 +1,17 @@
 from core import agent
 from core import listen
 
-print("⚡ I.R.I.S. Voice Core Online. Say 'shut down' to exit.")
+print("⚡ I.R.I.S. Neural Core Online.")
 
 while True:
-    # We replaced input() with our new microphone module!
-    user_input = listen.get_audio()
+    print("\n" + "═"*50)
+    # Give the user the choice: Type, or hit Enter to speak
+    user_input = input("⌨️  Type your message (or press ENTER to use Microphone): ").strip()
     
-    # If the mic didn't catch anything, loop back and listen again
+    # If the user just pressed Enter, fire up the microphone
+    if user_input == "":
+        user_input = listen.get_audio()
+        
     if not user_input:
         continue
         

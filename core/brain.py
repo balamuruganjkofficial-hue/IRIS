@@ -7,16 +7,16 @@ load_dotenv()
 with open("config.yaml", "r") as f:
     config = yaml.safe_load(f)
 
+# THE BRAIN TRANSPLANT: Swapping OpenRouter for Groq
 client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY")
+    base_url="https://api.groq.com/openai/v1",
+    api_key=os.getenv("GROQ_API_KEY")
 )
 
 def decide(messages):
     model_name = config["models"]["llm"]
     
     try:
-        # Temperature raised to 0.6 to give her actual personality and wit
         response = client.chat.completions.create(
             model=model_name,
             messages=messages,
