@@ -1,26 +1,30 @@
 from core import brain
 from skills import browser
 
-def run(user_text, max_steps=5):
-    # We upgraded her memory to include an "Available tools" manual
-    messages = [
-        {"role": "system", "content": """You are I.R.I.S., an autonomous AI. Address the user as Boss. 
+# 🧠 MEMORY BANK: This stays alive as long as the terminal is running
+memory = [
+    {"role": "system", "content": """You are I.R.I.S., an autonomous AI. Address the user as Boss. 
 You MUST respond in JSON. 
 Format: {"say": "message"} OR {"tool": "tool_name", "args": {"arg1": "value"}}
 
 Available tools:
-- browser: Opens the default web browser to search Google. Args: {"query": "the search term"}"""},
-        {"role": "user", "content": user_text}
-    ]
+- browser: Opens the default web browser to search Google. Args: {"query": "the search term"}"""}
+]
 
+def run(user_text, max_steps=5):
+    # 1. Add your new command to her memory bank
+    memory.append({"role": "user", "content": user_text})
+    
     print(f"\nBoss: {user_text}")
     
-    # The Decide-Act-Observe loop
+    # 2. The Decide-Act-Observe loop
     for step in range(max_steps):
-        action = brain.decide(messages)
+        action = brain.decide(memory)
         
         if "say" in action:
             print(f"I.R.I.S.: {action['say']}")
+            # 3. Add her final spoken answer to the memory bank so she remembers what she said
+            memory.append({"role": "assistant", "content": str(action)})
             return action["say"]
             
         if "tool" in action:
@@ -28,7 +32,6 @@ Available tools:
             args = action.get("args", {})
             print(f"⚙️  [SYSTEM: I.R.I.S. is running tool -> {tool_name} with args {args}]")
             
-            # The execution junction: routing her request to the real Python scripts
             if tool_name == "browser":
                 observation = browser.execute(args)
             else:
@@ -36,8 +39,9 @@ Available tools:
                 
             print(f"👁️  [OBSERVATION: {observation}]")
             
-            messages.append({"role": "assistant", "content": str(action)})
-            messages.append({"role": "user", "content": f"Observation: {observation}. Now tell the user it is done."})
+            # 4. Add tool actions and system observations to her memory
+            memory.append({"role": "assistant", "content": str(action)})
+            memory.append({"role": "user", "content": f"Observation: {observation}. Now tell the user it is done."})
             continue
 
     return "I could not finish that in time."
