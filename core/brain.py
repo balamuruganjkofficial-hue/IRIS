@@ -1,28 +1,28 @@
+import logging
 import os
-import yaml
-from openai import OpenAI
-from dotenv import load_dotenv
+from groq import Groq
+from core.config import CFG
 
-load_dotenv()
-with open("config.yaml", "r") as f:
-    config = yaml.safe_load(f)
+log = logging.getLogger("iris")
+_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+MODELS = [CFG["models"]["llm"], CFG["models"]["fallback"]]
 
-# THE BRAIN TRANSPLANT: Swapping OpenRouter for Groq
-client = OpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    api_key=os.getenv("GROQ_API_KEY")
-)
 
-def decide(messages):
-    model_name = config["models"]["llm"]
-    
-    try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            temperature=0.6 
-        )
-        return response.choices[0].message.content.strip()
-                
-    except Exception as e:
-        return f"Sorry Boss, my neural link experienced an error: {e}"
+def ask(messages, tools=None, max_tokens=700):
+    """Returns the model's message (has .content and .tool_calls), or None."""
+    for model in MODELS:
+        try:
+            kwargs = dict(model=model, messages=messages, max_tokens=max_tokens,
+                          temperature=0.4,
+                          extra_body={"reasoning_effort": "low"})
+            if tools:
+                kwargs["tools"] = tools
+                kwargs["tool_choice"] = "auto"
+            msg = _client.chat.completions.create(**kwargs).choices[0].message
+            if (msg.content or "").strip() or msg.tool_calls:
+                return msg
+            log.warning("model %s returned an empty reply", model)
+        except Exception as e:
+            log.warning("model %s failed: %s", model, e)
+            print(f"[brain] {model} failed: {e}")
+    return None

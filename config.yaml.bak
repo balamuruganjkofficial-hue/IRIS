@@ -1,0 +1,17 @@
+persona:
+  name: Iris
+  call_me: boss
+models:
+  llm: "openai/gpt-oss-20b"
+  fallback: "openai/gpt-oss-120b"
+voice:
+  tts_voice: "en-GB-SoniaNeural"
+  rate: "+10%"
+  stt_language: "en-US"
+memory:
+  recent_turns: 6
+  recalled_facts: 3
+chrome:
+  default_profile: ""
+  profiles:
+    (paste the printed lines here, keeping the 4 spaces at the start)

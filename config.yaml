@@ -1,3 +1,21 @@
+persona:
+  name: Iris
+  call_me: boss
 models:
-  llm: "llama-3.3-70b-versatile"
-  fallback: "llama-3.1-8b-instant"
+  llm: openai/gpt-oss-20b
+  fallback: openai/gpt-oss-120b
+voice:
+  tts_voice: en-GB-SoniaNeural
+  rate: +10%
+  stt_language: en-US
+memory:
+  recent_turns: 6
+  recalled_facts: 3
+chrome:
+  default_profile: ''
+  profiles:
+    balamurugan: Profile 2
+    balamuruganjkofficial: Profile 5
+    bmg: Profile 7
+    work: Profile 8
+    unfold: Profile 9

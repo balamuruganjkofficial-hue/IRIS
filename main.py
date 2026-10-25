@@ -1,22 +1,51 @@
-from core import agent
-from core import listen
+import logging
+from core.config import ROOT
 
-print("⚡ I.R.I.S. Neural Core Online.")
+(ROOT / "logs").mkdir(exist_ok=True)
+logging.basicConfig(filename=str(ROOT / "logs" / "iris.log"), level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
 
-while True:
-    print("\n" + "═"*50)
-    # Give the user the choice: Type, or hit Enter to speak
-    user_input = input("⌨️  Type your message (or press ENTER to use Microphone): ").strip()
-    
-    # If the user just pressed Enter, fire up the microphone
-    if user_input == "":
-        user_input = listen.get_audio()
-        
-    if not user_input:
-        continue
-        
-    if user_input.lower() in ['shut down', 'exit', 'quit', 'stop']:
-        print("I.R.I.S.: Shutting down systems. Goodbye, Boss.")
-        break
-        
-    agent.run(user_input)
+from core import agent, listen, voice  # noqa: E402
+
+voice_mode = False
+
+
+def confirm(question):
+    if voice_mode:
+        voice.speak(question + " Say yes or no.")
+        voice.wait_done()
+        ans = listen.listen(timeout=6).lower()
+        return ans.startswith("yes") or "confirm" in ans
+    return input(f"[CONFIRM] {question} (y/n): ").strip().lower().startswith("y")
+
+
+def main():
+    global voice_mode
+    print("Iris online. Type a command, press Enter alone to speak, or type 'quit'.")
+    voice.speak("Iris online.")
+    while True:
+        try:
+            text = input("You (Enter = speak): ").strip()
+            voice_mode = False
+            if text.lower() in ("quit", "exit"):
+                break
+            if text == "":
+                print("Listening...")
+                text = listen.listen()
+                if not text:
+                    print("I did not catch that.")
+                    continue
+                voice_mode = True
+                print("You said:", text)
+            if text.lower() in ("stop", "be quiet", "cancel"):
+                voice.stop()
+                continue
+            print("Iris:", agent.run(text, confirm))
+            voice.wait_done()
+        except KeyboardInterrupt:
+            voice.stop()
+            break
+
+
+if __name__ == "__main__":
+    main()

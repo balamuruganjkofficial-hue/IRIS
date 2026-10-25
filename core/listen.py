@@ -1,39 +1,27 @@
 import speech_recognition as sr
-import time
+from core.config import CFG
 
-def get_audio():
-    """Listens to the microphone and converts spoken words to text."""
-    r = sr.Recognizer()
-    
-    # SPEED HACK: Reduces the silence she waits for before processing (default is 0.8s)
-    r.pause_threshold = 1.5
-    
-    # CRASH FIX: We wrapped the *entire* microphone connection in the try block
+_r = sr.Recognizer()
+_r.pause_threshold = 0.8
+
+
+def listen(timeout=8, phrase_limit=12):
     try:
-        with sr.Microphone() as source:
-            print("\n🎙️ [Listening... Speak now]")
-            
-            # Calibrate faster
-            r.adjust_for_ambient_noise(source, duration=0.2) 
-            
-            audio = r.listen(source, timeout=5, phrase_time_limit=15)
-            
-            # Added a visual cue so you know she isn't frozen, just thinking
-            print("⏳ [Translating to cloud...]") 
-            text = r.recognize_google(audio)
-            print(f"🗣️ You said: {text}")
-            return text
-            
+        with sr.Microphone() as src:
+            _r.adjust_for_ambient_noise(src, duration=0.5)
+            print("(speak now)")
+            audio = _r.listen(src, timeout=timeout, phrase_time_limit=phrase_limit)
     except sr.WaitTimeoutError:
-        return "" 
+        print("[mic] no speech started within", timeout, "seconds")
+        return ""
+    except OSError as e:
+        print("[mic error]", e)
+        return ""
+    try:
+        return _r.recognize_google(audio, language=CFG["voice"]["stt_language"])
     except sr.UnknownValueError:
-        print("❌ [SYSTEM: Could not understand audio.]")
+        print("[mic] heard sound but could not understand it")
         return ""
-    except sr.RequestError:
-        print("❌ [SYSTEM: Network error with Google.]")
-        return ""
-    except Exception as e:
-        # This catches that nasty -9999 Windows host error and prevents a crash
-        print(f"❌ [SYSTEM: Microphone glitch, resetting... -> {e}]")
-        time.sleep(1) # Give the Windows audio driver a second to recover
+    except sr.RequestError as e:
+        print("[mic] speech service error:", e)
         return ""
