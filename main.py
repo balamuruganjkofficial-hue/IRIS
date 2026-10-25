@@ -1,15 +1,18 @@
 from core import agent
+from core import listen
 
-print("⚡ I.R.I.S. Core Online. Type 'exit' to shut down.")
+print("⚡ I.R.I.S. Voice Core Online. Say 'shut down' to exit.")
 
 while True:
-    # Get user input
-    user_input = input("\n> ")
+    # We replaced input() with our new microphone module!
+    user_input = listen.get_audio()
     
-    # Check for the kill word
-    if user_input.lower() in ['exit', 'quit', 'stop']:
+    # If the mic didn't catch anything, loop back and listen again
+    if not user_input:
+        continue
+        
+    if user_input.lower() in ['shut down', 'exit', 'quit', 'stop']:
         print("I.R.I.S.: Shutting down systems. Goodbye, Boss.")
         break
         
-    # Send the input to the agent loop
     agent.run(user_input)

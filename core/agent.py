@@ -1,47 +1,73 @@
+import re
+import datetime
 from core import brain
+from core import voice
 from skills import browser
 
-# 🧠 MEMORY BANK: This stays alive as long as the terminal is running
-memory = [
-    {"role": "system", "content": """You are I.R.I.S., an autonomous AI. Address the user as Boss. 
-You MUST respond in JSON. 
-Format: {"say": "message"} OR {"tool": "tool_name", "args": {"arg1": "value"}}
+def get_vitals():
+    """Fetches real-time system context so she isn't blind."""
+    now = datetime.datetime.now()
+    return f"Time: {now.strftime('%I:%M %p')}. Date: {now.strftime('%A, %B %d, %Y')}. OS: Windows."
 
-Available tools:
-- browser: Opens the default web browser to search Google. Args: {"query": "the search term"}"""}
-]
+memory = []
 
-def run(user_text, max_steps=5):
-    # 1. Add your new command to her memory bank
+def boot_sequence():
+    """Initializes her personality and environmental awareness."""
+    if not memory:
+        memory.append({
+            "role": "system", 
+            "content": f"""You are I.R.I.S., a highly intelligent, slightly witty autonomous AI. 
+Your Boss is Bala. You are running locally on his Windows machine. 
+Do NOT act like a robotic language model. Speak naturally, confidently, and with personality.
+
+SYSTEM VITALS: {get_vitals()}
+
+TOOL PROTOCOL:
+If you need to search the web, embed this exact tag anywhere in your response: <TOOL>browser|search query</TOOL>
+Example: "I'll look that up for you right now, Boss. <TOOL>browser|Python automation</TOOL>"
+Otherwise, just speak naturally."""
+        })
+
+def run(user_text, max_steps=3):
+    boot_sequence()
     memory.append({"role": "user", "content": user_text})
-    
     print(f"\nBoss: {user_text}")
     
-    # 2. The Decide-Act-Observe loop
     for step in range(max_steps):
-        action = brain.decide(memory)
+        raw_response = brain.decide(memory)
         
-        if "say" in action:
-            print(f"I.R.I.S.: {action['say']}")
-            # 3. Add her final spoken answer to the memory bank so she remembers what she said
-            memory.append({"role": "assistant", "content": str(action)})
-            return action["say"]
+        # Hunt for the hidden tool tags in her natural speech
+        tool_match = re.search(r'<TOOL>(.*?)\|(.*?)</TOOL>', raw_response)
+        
+        if tool_match:
+            tool_name = tool_match.group(1)
+            args = tool_match.group(2)
             
-        if "tool" in action:
-            tool_name = action["tool"]
-            args = action.get("args", {})
-            print(f"⚙️  [SYSTEM: I.R.I.S. is running tool -> {tool_name} with args {args}]")
+            # Strip the tag from the text so she doesn't speak the raw code
+            spoken_text = re.sub(r'<TOOL>.*?</TOOL>', '', raw_response).strip()
+            
+            if spoken_text:
+                voice.speak(spoken_text)
+                
+            print(f"⚙️  [SYSTEM: Executing -> {tool_name} with arg: '{args}']")
             
             if tool_name == "browser":
-                observation = browser.execute(args)
+                # We format the regex arg back into a dictionary for the browser script
+                observation = browser.execute({"query": args})
             else:
-                observation = f"Error: Tool '{tool_name}' does not exist."
+                observation = f"Error: Tool {tool_name} not recognized."
                 
             print(f"👁️  [OBSERVATION: {observation}]")
             
-            # 4. Add tool actions and system observations to her memory
-            memory.append({"role": "assistant", "content": str(action)})
-            memory.append({"role": "user", "content": f"Observation: {observation}. Now tell the user it is done."})
+            # Feed the observation back into her memory so she can analyze it
+            memory.append({"role": "assistant", "content": raw_response})
+            memory.append({"role": "user", "content": f"System Observation: {observation}. Analyze this and reply briefly."})
             continue
-
-    return "I could not finish that in time."
+            
+        else:
+            # Pure conversation, no tools required
+            voice.speak(raw_response)
+            memory.append({"role": "assistant", "content": raw_response})
+            return raw_response
+            
+    return "I timed out processing that."
