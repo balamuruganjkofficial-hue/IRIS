@@ -1,4 +1,5 @@
 import os
+import re
 import time
 
 import speech_recognition as sr
@@ -7,21 +8,27 @@ from groq import Groq
 from core.config import CFG
 
 _r = sr.Recognizer()
-_r.pause_threshold = 0.8
-_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+_r.pause_threshold = 1.1            # waits longer before deciding you finished
+_r.non_speaking_duration = 0.6
+_client = Groq(api_key=os.getenv("GROQ_API_KEY"), timeout=8.0, max_retries=0)
 
 _V = CFG["voice"]
-_LANG = _V.get("stt_language", "en-US").split("-")[0]          # "en-US" -> "en"
+_LANG = _V.get("stt_language", "en-US").split("-")[0]
 _MODELS = _V.get("stt_models", ["whisper-large-v3-turbo", "whisper-large-v3"])
 _WORDS = (["Iris", "Chrome", "Notepad", "YouTube", "Gmail", "LinkedIn", "Google",
-           "screenshot", "reminder", "explorer", "calculator"]
+           "screenshot", "reminder", "brightness", "volume", "Downloads"]
           + list(CFG.get("chrome", {}).get("profiles", {}))[:20])
 _HINT = "Voice commands for a PC assistant named Iris: " + ", ".join(_WORDS) + "."
-_JUNK = {"you", "thanks for watching", "thank you for watching"}
+_FILLERS = {"mm", "hmm", "mhm", "um", "uh", "ah", "oh", "huh", "you", "ok", "okay",
+            "thanks for watching", "thank you for watching"}
+
+
+def _junk(text):
+    t = re.sub(r"[^a-z0-9 ]", "", text.lower()).strip()
+    return len(t) < 2 or t in _FILLERS
 
 
 def _whisper(audio):
-    """Returns the text, or None if the service failed."""
     wav = audio.get_wav_data(convert_rate=16000, convert_width=2)
     for model in _MODELS:
         try:
@@ -44,7 +51,7 @@ def _google(audio):
         return ""
 
 
-def listen(timeout=8, phrase_limit=12):
+def listen(timeout=8, phrase_limit=15):
     try:
         with sr.Microphone() as src:
             _r.adjust_for_ambient_noise(src, duration=0.5)
@@ -58,8 +65,7 @@ def listen(timeout=8, phrase_limit=12):
         return ""
 
     seconds = len(audio.frame_data) / (audio.sample_rate * audio.sample_width)
-    if seconds < 0.4:
-        print("[mic] too short, ignored")
+    if seconds < 0.5:
         return ""
 
     t0 = time.time()
@@ -68,6 +74,4 @@ def listen(timeout=8, phrase_limit=12):
         print("[stt] using Google fallback")
         text = _google(audio)
     print(f"[stt] {time.time() - t0:.1f}s")
-    if text.lower().strip(" .!?") in _JUNK:
-        return ""
-    return text
+    return "" if _junk(text) else text

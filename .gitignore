@@ -3,4 +3,4 @@ venv/
 keys/
 data/
 logs/
-__pycache__/
+__pycache__/workspace/
