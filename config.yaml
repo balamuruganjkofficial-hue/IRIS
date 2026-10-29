@@ -10,6 +10,7 @@ voice:
   stt_language: en-US
   wake_word: hey_jarvis
   wake_threshold: 0.35
+  end_silence: 0.7
 memory:
   recent_turns: 6
   recalled_facts: 3

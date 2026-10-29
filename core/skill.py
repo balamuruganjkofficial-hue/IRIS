@@ -1,8 +1,13 @@
-﻿import inspect
+import inspect
 import logging
 
 log = logging.getLogger("iris")
 REGISTRY = {}
+
+_SAY = {"type": "string",
+        "description": ("One short, natural sentence to say aloud RIGHT NOW while the "
+                        "action runs, like 'Sure, pulling up LinkedIn.' or 'Typing that "
+                        "in now.' Never state results here.")}
 
 
 def skill(description, level=1, observe=False):
@@ -30,8 +35,9 @@ def tool_schemas():
             "description": s["description"],
             "parameters": {
                 "type": "object",
-                "properties": {p: {"type": "string"} for p in s["params"]},
-                "required": s["required"],
+                "properties": {"say": _SAY,
+                               **{p: {"type": "string"} for p in s["params"]}},
+                "required": ["say"] + s["required"],
             }}})
     return out
 
