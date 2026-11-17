@@ -1,19 +1,93 @@
 persona:
   name: Iris
   call_me: boss
+  # How human she feels. 0 = off, 1 = maximum.
+  vibe: warm, playful, quietly cheeky
+  humour: 0.7          # how often a reply carries a joke or a jab
+  teasing: 0.6         # how much she mocks you - never cruelly
+  curiosity: 0.7       # how often she asks a real follow-up question
+  opinions: true       # she may disagree and say what she actually thinks
+  proactive: true      # one gentle line after a long silence
+  idle_minutes: 25     # minutes of silence before that line
+  idle_gap_minutes: 45 # minimum gap between two idle lines
+  idle_lines: []       # optional custom lines, {call} is replaced
 models:
   llm: openai/gpt-oss-20b
   fallback: openai/gpt-oss-120b
+  # Extra free models. Any OpenAI-compatible provider with a key in .env works:
+  # groq, openrouter, gemini, cerebras, mistral, github, ollama.
+  free_fallbacks: []
+  openrouter_free: true      # auto-discover free, tool-capable OpenRouter models
+  openrouter_models: []      # optional fixed :free IDs, overrides discovery
+  openrouter_max: 4
+  gemini_model: gemini-2.5-flash
+  cerebras_model: llama-3.3-70b
+  mistral_model: mistral-small-latest
+  github_model: openai/gpt-4o-mini
+  ollama_models: []          # opt-in local models, e.g. [llama3.2]
+brain:
+  max_tokens: 400
+  temperature: 0.7
+  max_steps: 10
+  max_tool_calls: 3
+  request_timeout: 20
+  fallback_budget: 50
 voice:
   tts_voice: en-GB-SoniaNeural
-  rate: +10%
+  rate: +8%
+  pitch: +0Hz
+  prosody: true                # subtle per-phrase pitch/rate variation
+  rate_jitter: 4               # ± percent
+  pitch_jitter: 3              # ± Hz
   stt_language: en-US
-  wake_word: hey_jarvis
+  stt_models:
+    - whisper-large-v3-turbo
+    - whisper-large-v3
+  wake_word: iris
+  wake_engine: auto            # auto | vosk | openwakeword
+  wake_phrases: [iris, hey iris, hi iris, hello iris, okay iris, ok iris, jarvis, hey jarvis]
+  wake_fallback: hey_jarvis    # openWakeWord model used only if Vosk is absent
   wake_threshold: 0.35
+  barge_in: true
+  barge_in_threshold: 0.85
+  vosk_model: data/vosk/vosk-model-small-en-us-0.15
+  vosk_download: true
+  vosk_url: https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+  vad_min_rms: 250
   end_silence: 0.7
+  wake_debug: false
+  chime: true
+  cache_chars: 90
+  cache_files: 400
 memory:
-  recent_turns: 6
+  recent_turns: 4
   recalled_facts: 3
+  max_turns: 400
+permissions:
+  voice_confirm: true
+  timeout: 9
+  attempts: 2
+  click_fallback: true
+browser:
+  headless: true
+  show_in_ui: true
+  capture_quality: 70
+  capture_width: 1280
+  keep_shots: 40
+  local_files: true
+  external_chrome: false
+web:
+  max_results: 6
+  show_in_ui: true
+surface:
+  enabled: true
+  ratio: 0.70
+  max_tabs: 5
+  live_fps: 6
+  embed_apps: true
+  park_windows: true
+paths:
+  workspace: ''
 chrome:
   default_profile: ''
   profiles:
@@ -22,3 +96,21 @@ chrome:
     bmg: Profile 7
     work: Profile 8
     unfold: Profile 9
+ui:
+  enabled: true
+  width: 1020
+  height: 700
+  fps: 30
+  always_on_top: false
+  cyber: true
+  surface_ratio: 0.70
+  bg: '#0C0509'
+  bg2: '#160710'
+  surface: '#220A14'
+  surface_hi: '#34101E'
+  accent: '#FF4D7D'
+  accent_soft: '#FF8FAB'
+  text: '#FFEFF3'
+  muted: '#B48A96'
+  user_bubble: '#5A1030'
+  iris_bubble: '#220A14'

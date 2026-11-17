@@ -5,9 +5,8 @@ log = logging.getLogger("iris")
 REGISTRY = {}
 
 _SAY = {"type": "string",
-        "description": ("One short, natural sentence to say aloud RIGHT NOW while the "
-                        "action runs, like 'Sure, pulling up LinkedIn.' or 'Typing that "
-                        "in now.' Never state results here.")}
+        "description": ("One short, natural sentence to say aloud right now while the "
+                        "action runs. Never state results here.")}
 
 
 def skill(description, level=1, observe=False):
@@ -25,10 +24,12 @@ def skill(description, level=1, observe=False):
     return wrap
 
 
-def tool_schemas():
+def tool_schemas(prefix=None):
     out = []
     for name, s in REGISTRY.items():
         if s["level"] >= 3:
+            continue
+        if prefix and not name.startswith(prefix):
             continue
         out.append({"type": "function", "function": {
             "name": name,

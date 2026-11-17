@@ -3,4 +3,11 @@ venv/
 keys/
 data/
 logs/
-__pycache__/workspace/
+workspace/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.log
+Thumbs.db
+desktop.ini

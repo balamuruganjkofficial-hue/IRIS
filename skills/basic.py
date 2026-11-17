@@ -13,13 +13,6 @@ from core import memory, voice
 from core.config import CFG, ROOT
 from core.skill import skill
 
-APPS = {"edge": "msedge", "notepad": "notepad", "calculator": "calc",
-        "explorer": "explorer", "vscode": "code", "paint": "mspaint",
-        "word": "winword", "excel": "excel"}
-PROCS = {"chrome": "chrome.exe", "edge": "msedge.exe", "notepad": "notepad.exe",
-         "calculator": "CalculatorApp.exe", "vscode": "Code.exe",
-         "paint": "mspaint.exe", "word": "WINWORD.EXE", "excel": "EXCEL.EXE"}
-
 _USER_DATA = os.path.join(os.environ.get("LOCALAPPDATA", ""),
                           "Google", "Chrome", "User Data")
 _CHROME_PATHS = [
@@ -72,74 +65,45 @@ def _resolve_profile(want):
 
 
 def _chrome(url=None, profile=""):
-    folder = _resolve_profile(profile)
-    if folder is None:
-        return f"ERROR: no Chrome profile called '{profile}'. Profiles: {_NAMES_TXT}."
-    exe = next((p for p in _CHROME_PATHS if os.path.exists(p)), None)
-    if not exe:
-        webbrowser.open(url or "https://www.google.com")
-        return "ERROR: Chrome was not found, so I used the default browser."
-    cmd = [exe, "--profile-directory=" + folder]
-    if url:
-        cmd.append(url)
-    subprocess.Popen(cmd)
-    print(f"[chrome] profile folder: {folder}")
-    return "Opened Chrome."
+    """Every browser task is shown *inside* Iris; no external Chrome window.
+
+    The ``profile`` argument is kept so older spoken commands still work.
+    """
+    from skills import surface
+    return surface.open_browser(url or None)
 
 
-@skill(f"Open Google Chrome. Args: profile (optional, one of: {_NAMES_TXT}; "
-       "leave empty if the user did not name a profile)")
+@skill("Open Iris's own browser inside her interface, with her start page and "
+       "search box. Use this whenever the user says 'open Chrome' or 'open the "
+       "browser'. Args: profile (optional; accepted for compatibility)")
 def open_chrome(profile=""):
-    return _chrome(profile=profile)
+    from skills.browser_agent import browser_home
+    result = browser_home()
+    if result.startswith("ERROR"):
+        return result
+    return "Opened my browser inside the interface."
 
 
-@skill("Open an app (not Chrome). Args: name (edge, notepad, calculator, explorer, "
-       "vscode, paint, word, excel)")
-def open_app(name):
-    key = name.lower().strip()
-    if key in ("chrome", "google chrome"):
-        return _chrome()
-    token = APPS.get(key)
-    if not token:
-        return "ERROR: unknown app. Known apps: " + ", ".join(APPS)
-    subprocess.Popen(["cmd", "/c", "start", "", token],
-                     creationflags=subprocess.CREATE_NO_WINDOW)
-    return "Opened " + name + "."
-
-
-@skill("Close an app. Args: name (chrome, edge, notepad, calculator, vscode, paint, "
-       "word, excel)", level=2)
-def close_app(name):
-    exe = PROCS.get(name.lower().strip())
-    if not exe:
-        return "ERROR: unknown app."
-    n = 0
-    for p in psutil.process_iter(["name"]):
-        if (p.info["name"] or "").lower() == exe.lower():
-            try:
-                p.terminate()
-                n += 1
-            except psutil.Error:
-                pass
-    return f"Closed {n} {name} process(es)."
-
-
-@skill("Search Google in Chrome. Args: query, profile (optional Chrome profile name)")
+@skill("Search the web and show the results page inside Iris's own browser panel. "
+       "Args: query, profile (optional; accepted for compatibility)")
 def google_search(query, profile=""):
-    r = _chrome(url="https://www.google.com/search?q=" + urllib.parse.quote_plus(query),
-                profile=profile)
-    return "Searching." if not r.startswith("ERROR") else r
+    from skills.browser_agent import browser_search
+    result = browser_search(query)
+    return result if result.startswith("ERROR") else "Searching inside my interface."
 
 
-@skill("Open a website in Chrome. Args: url, profile (optional Chrome profile name)")
+@skill("Show a website inside Iris's own browser panel. Args: url, profile "
+       "(optional; accepted for compatibility)")
 def open_website(url, profile=""):
-    url = url.strip()
+    from skills.browser_agent import browser_open
+    url = str(url or "").strip()
     if " " in url or "." not in url:
         return "ERROR: that does not look like a website."
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
-    r = _chrome(url=url, profile=profile)
-    return "Opened " + url + "." if not r.startswith("ERROR") else r
+    result = browser_open(url)
+    return result if result.startswith("ERROR") else \
+        "Opened {0} inside my interface.".format(url)
 
 
 @skill("Get battery, RAM and CPU status. No args.", observe=True)
@@ -176,19 +140,34 @@ def set_reminder(minutes, text):
 
 @skill("Show a desktop notification. Args: title, message")
 def notify(title, message):
-    notification.notify(title=title, message=message, timeout=6)
+    try:
+        notification.notify(title=title, message=message, timeout=6)
+    except Exception as e:
+        return f"ERROR: could not show the notification: {e}"
     return "Shown."
 
 
-@skill("Take a screenshot of the screen and save it. No args.")
+@skill("Take a screenshot of the screen and show it inside Iris's own interface. "
+       "No args.")
 def screenshot():
     from PIL import ImageGrab
     folder = ROOT / "data" / "screenshots"
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / datetime.datetime.now().strftime("shot_%Y%m%d_%H%M%S.png")
-    ImageGrab.grab().save(path)
+    try:
+        try:
+            ImageGrab.grab(all_screens=True).save(path)
+        except TypeError:                     # older Pillow
+            ImageGrab.grab().save(path)
+    except Exception as e:
+        return f"ERROR: could not take the screenshot: {e}"
     print("[screenshot]", path)
-    return "Screenshot saved."
+    try:
+        from skills import surface
+        surface.show_image(str(path), title="Screenshot")
+    except Exception:  # noqa: BLE001
+        pass
+    return "Screenshot taken and shown inside my interface."
 
 
 @skill("Remember a fact about the user for later. Args: fact")

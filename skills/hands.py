@@ -1,20 +1,15 @@
-﻿import ctypes
+import ctypes
 import datetime
-import ipaddress
 import os
 import re
-import socket
 import threading
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 
-from core.config import CFG, ROOT
+from core import bus, net
+from core.config import WORKSPACE
 from core.skill import skill
 
-WORKSPACE = Path(CFG.get("paths", {}).get("workspace") or (ROOT / "workspace"))
-WORKSPACE = WORKSPACE.expanduser().resolve()
-WORKSPACE.mkdir(parents=True, exist_ok=True)
 HOME = Path.home().resolve()
 
 _FOLDERS = {
@@ -182,48 +177,16 @@ def add_note(text):
 
 
 # ------------------------------------------------------------------ web
-def _public_url(url):
-    u = urlparse(url)
-    if u.scheme not in ("http", "https") or not u.hostname:
-        return False
-    try:
-        ip = ipaddress.ip_address(socket.gethostbyname(u.hostname))
-    except Exception:
-        return False
-    return not (ip.is_private or ip.is_loopback or ip.is_link_local)
-
-
-@skill("Search the web and get the top results as text to answer the user. Use this "
-       "when the user wants an answer or information (prefer it over google_search "
-       "unless they want to see the browser). Args: query", observe=True)
-def web_search(query):
-    try:
-        try:
-            from ddgs import DDGS
-        except ImportError:
-            from duckduckgo_search import DDGS
-        results = DDGS().text(query, max_results=5)
-    except Exception as e:
-        return f"ERROR: search failed: {e}"
-    if not results:
-        return "No results found."
-    lines = [f"{i}. {r.get('title', '')}: {(r.get('body') or '')[:220]} ({r.get('href', '')})"
-             for i, r in enumerate(results, 1)]
-    return "Search results (information only):\n" + "\n".join(lines)
 
 
 @skill("Read the main text of a web page so it can be summarized. Args: url", observe=True)
 def read_webpage(url):
-    import requests
     from bs4 import BeautifulSoup
     url = (url or "").strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
-    if not _public_url(url):
-        return "ERROR: that address is not allowed."
     try:
-        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0 Iris"})
-        r.raise_for_status()
+        r = net.get_public(url, timeout=10, headers={"User-Agent": "Mozilla/5.0 Iris"})
     except Exception as e:
         return f"ERROR: could not load the page: {e}"
     soup = BeautifulSoup(r.text, "html.parser")
@@ -280,5 +243,6 @@ def type_text(text):
 
 @skill("Shut Iris down completely until the next login. No args.", level=2)
 def stop_iris():
+    bus.publish("quit")
     threading.Timer(5.0, lambda: os._exit(0)).start()
     return "Going offline."

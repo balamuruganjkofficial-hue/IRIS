@@ -1,4 +1,12 @@
-﻿import collections
+"""The microphone: wake word, voice activity detection and bar signals.
+
+One stream stays open all the time.
+Modes:  idle   = wait for the wake word
+        listen = capture one sentence
+        busy   = Iris is thinking or speaking (wake word = interrupt)
+"""
+
+import collections
 import queue
 import threading
 import time
@@ -6,8 +14,9 @@ import time
 import numpy as np
 import pyaudio
 
-from core import wake
+from core import bus
 from core.config import CFG
+from core import wake
 
 RATE = 16000
 CHUNK = 1280                  # 80 ms per frame
@@ -15,11 +24,6 @@ FRAME_S = CHUNK / RATE
 
 
 class Ears:
-    """Owns the microphone. One stream stays open all the time.
-    Modes:  idle   = wait for the wake word
-            listen = capture one sentence
-            busy   = Iris is thinking or speaking (wake word = interrupt)"""
-
     def __init__(self):
         v = CFG["voice"]
         self.wake_thr = float(v.get("wake_threshold", 0.5))
@@ -33,13 +37,25 @@ class Ears:
         self.noise = 100.0
         self._mode, self._deadline, self._gen = "busy", 0.0, 0
         self._lock = threading.Lock()
-        threading.Thread(target=self._supervisor, daemon=True).start()
+        self._level = 0.0
+        self._stream = None
+        self._pa = None
+        self.mic_ok = False
+        threading.Thread(target=self._supervisor, daemon=True, name="ears").start()
 
     def set_mode(self, mode, timeout=7.0):
         with self._lock:
             self._mode = mode
             self._deadline = time.time() + timeout
             self._gen += 1
+        if mode == "listen":
+            bus.publish("state", "listening")
+        elif mode == "idle":
+            bus.publish("state", "idle")
+
+    def mode(self):
+        with self._lock:
+            return self._mode
 
     def flush(self):
         try:
@@ -48,11 +64,33 @@ class Ears:
         except queue.Empty:
             pass
 
+    def close(self):
+        self.mic_ok = False
+        try:
+            if self._stream is not None:
+                self._stream.stop_stream()
+                self._stream.close()
+        except Exception:
+            pass
+        try:
+            if self._pa is not None:
+                self._pa.terminate()
+        except Exception:
+            pass
+        self._stream = self._pa = None
+
     def _finish(self, kind, payload):
         with self._lock:
             self._mode = "idle" if kind == "timeout" else "busy"
             self._gen += 1
         self.events.put((kind, payload))
+
+    def _publish_level(self, rms):
+        if not bus.has_subscribers("level"):
+            return
+        raw = min(1.0, rms / 2200.0)
+        self._level = 0.55 * self._level + 0.45 * raw
+        bus.publish("level", self._level)
 
     def _supervisor(self):
         fails = 0
@@ -62,6 +100,7 @@ class Ears:
             except Exception as e:            # e.g. after sleep/resume or mic unplugged
                 fails += 1
                 print("[ears] restarting after error:", e)
+                bus.publish("toast", "Microphone hiccup - reconnecting.")
                 time.sleep(min(10, 1 + fails))
 
     def _run(self):
@@ -70,9 +109,12 @@ class Ears:
             model = wake._load()
         except Exception as e:
             print("[ears] wake word unavailable:", e)
-        pa = pyaudio.PyAudio()
-        stream = pa.open(format=pyaudio.paInt16, channels=1, rate=RATE,
-                         input=True, frames_per_buffer=CHUNK)
+            bus.publish("toast", "Wake word model unavailable.")
+        self._pa = pyaudio.PyAudio()
+        self._stream = self._pa.open(format=pyaudio.paInt16, channels=1, rate=RATE,
+                                     input=True, frames_per_buffer=CHUNK)
+        self.mic_ok = True
+        stream = self._stream
         preroll = collections.deque(maxlen=8)          # ~0.64 s kept before speech starts
         frames, started, voiced, last_voice, seen_gen = [], False, 0, 0.0, -1
         cooldown, dbg_t, dbg_rms, dbg_peak = 0.0, time.time(), 0.0, 0.0
@@ -95,10 +137,11 @@ class Ears:
                         except Exception:
                             pass
 
+                self._publish_level(rms)
                 dbg_rms = max(dbg_rms, rms)
                 if self.debug and now - dbg_t > 2:
-                    print(f"[ears] mode={mode} rms={dbg_rms:.0f} noise={self.noise:.0f} "
-                          f"wake={dbg_peak:.2f}")
+                    print("[ears] mode={0} rms={1:.0f} noise={2:.0f} wake={3:.2f}".format(
+                        mode, dbg_rms, self.noise, dbg_peak))
                     dbg_t, dbg_rms, dbg_peak = now, 0.0, 0.0
 
                 if mode == "listen":
@@ -139,9 +182,17 @@ class Ears:
                         self.on_interrupt()
                     self.set_mode("listen", 7.0)
         finally:
-            stream.stop_stream()
-            stream.close()
-            pa.terminate()
+            self.mic_ok = False
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+            try:
+                self._pa.terminate()
+            except Exception:
+                pass
+            self._stream = self._pa = None
 
 
 ears = Ears()
