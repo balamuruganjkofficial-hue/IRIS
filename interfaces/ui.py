@@ -2,9 +2,10 @@
 tkinter (no extra dependencies). The assistant runs on its own thread; this file
 only paints, animates and forwards input through a thread-safe queue.
 
-Everything Iris opens - web pages, images, documents, folders, dashboards and
-even whole applications - is drawn inside the ``surface`` panel on the right,
-so no separate window ever steals focus.
+Apps and Chrome open as normal Windows windows now; the ``surface`` panel is an
+optional place to show a document, image, folder, dashboard or a mirrored
+window. A small floating avatar (``interfaces/avatar.py``) lives outside this
+window, so Iris is a presence on the desktop rather than a page you visit.
 """
 
 import ctypes
@@ -243,6 +244,7 @@ class IrisUI:
         self._toast = ""
         self._toast_until = 0.0
         self._latency = 0.0
+        self._offline = False
         self._t0 = time.perf_counter()
         self._last = self._t0
         self._geom = (0, 0)
@@ -287,6 +289,48 @@ class IrisUI:
 
         self._build()
         self._bind_bus()
+        self.avatar = None
+        if bool(_UI.get("avatar", True)):
+            self._build_avatar()
+
+    def _build_avatar(self):
+        """Create the small human avatar that lives outside the main window."""
+        try:
+            if __package__ in (None, ""):
+                from avatar import Avatar
+            else:
+                from interfaces.avatar import Avatar
+        except Exception:  # noqa: BLE001 - the UI still works without it
+            logging.getLogger("iris").exception("avatar import failed")
+            return
+        try:
+            self.avatar = Avatar(
+                self.root,
+                on_open=self._reveal,
+                on_listen=lambda: self.send(""),
+                on_stop=self.stop_cb)
+        except Exception:  # noqa: BLE001 - never block the main interface
+            logging.getLogger("iris").exception("could not create the avatar")
+            self.avatar = None
+
+    def _reveal(self):
+        """Bring the main window back from the avatar or a minimised state."""
+        try:
+            self.root.overrideredirect(True)
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
+    def _toggle_avatar(self):
+        """Show or hide the floating avatar from the main title bar."""
+        if self.avatar is None:
+            return
+        if self.avatar.visible():
+            self.avatar.hide()
+        else:
+            self.avatar.show()
 
     # ---------------------------------------------------------- construction
     def _build(self):
@@ -312,7 +356,8 @@ class IrisUI:
 
         buttons = tk.Frame(self.topbar, bg=BG1)
         buttons.grid(row=0, column=2, sticky="e", padx=(0, 12 * s))
-        for text, cmd, hover in (("–", self._minimise, SURFACE_HI),
+        for text, cmd, hover in (("O", self._toggle_avatar, SURFACE_HI),
+                                 ("–", self._minimise, SURFACE_HI),
                                  ("▢", self._maximise, SURFACE_HI),
                                  ("✕", self._close, "#7A1330")):
             b = tk.Label(buttons, text=text, bg=BG1, fg=MUTED,
@@ -1100,7 +1145,7 @@ class IrisUI:
     def _bind_bus(self):
         for topic in ("state", "say", "reply", "heard", "tool", "level",
                       "latency", "toast", "auth", "view", "results", "surface",
-                      "surface_frame"):
+                      "surface_frame", "connectivity"):
             bus.subscribe(topic, lambda payload, t=topic: self._q.put((t, payload)))
 
     # ---------------------------------------------------------- input events
@@ -1556,6 +1601,8 @@ class IrisUI:
             status, color = "thinking…", MUTED
         else:
             status, color = "ready", MUTED
+        if self._offline and not self._toast and state in ("idle", "listening"):
+            status, color = "offline - local mode", ACCENT_SOFT
         c.itemconfigure(self._status, text=status, fill=color)
         c.itemconfigure(self._latency,
                         text=("first word  %.1fs" % self._latency) if self._latency else "")
@@ -1621,11 +1668,18 @@ class IrisUI:
                     self.level = max(0.0, min(1.0, float(rest[0])))
                 except (TypeError, ValueError):
                     pass
+                if self.avatar is not None:
+                    self.avatar.set_level(self.level)
             elif kind == "latency":
                 try:
                     self._latency = float(rest[0])
                 except (TypeError, ValueError):
                     pass
+            elif kind == "connectivity":
+                payload = rest[0] if rest else {}
+                self._offline = not bool(
+                    payload.get("online", True) if isinstance(payload, dict)
+                    else payload)
             elif kind == "toast":
                 self._toast = str(rest[0])
                 self._toast_until = time.perf_counter() + 4.5
@@ -1660,11 +1714,15 @@ class IrisUI:
             self._stream_bubble = None
             self._stream_idx = None
         self._palette()
+        if self.avatar is not None:
+            self.avatar.set_state(state)
 
     def _on_say(self, sentence):
         text = str(sentence).strip()
         if not text:
             return
+        if self.avatar is not None:
+            self.avatar.say(text)
         if self._stream_idx is None or self._stream_idx >= len(self._log):
             self._log.append(("iris", text))
             self._stream_idx = len(self._log) - 1
@@ -1680,6 +1738,8 @@ class IrisUI:
         text = str(reply).strip()
         if not text:
             return
+        if self.avatar is not None:
+            self.avatar.say(text)
         if self._stream_idx is not None and self._stream_idx < len(self._log):
             self._log[self._stream_idx] = ("iris", text)
             if self._stream_bubble is not None:
@@ -1707,6 +1767,11 @@ class IrisUI:
         if self._closed:
             return
         self._closed = True
+        if self.avatar is not None:
+            try:
+                self.avatar.close()
+            except Exception:  # noqa: BLE001
+                pass
         try:
             self.root.destroy()
         except tk.TclError:

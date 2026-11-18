@@ -14,6 +14,7 @@ from pathlib import Path
 
 import psutil
 
+from core.config import CFG
 from core.skill import skill
 
 HOME = Path.home()
@@ -263,19 +264,33 @@ def launch_file_raw(path):
         return "ERROR: {0}".format(e)
 
 
-@skill("Open any application by name. It appears inside Iris's own interface, "
-       "embedded or mirrored live - never in a separate window. Args: name")
+def _embed_apps():
+    """True only when the user asks for apps to be mirrored inside Iris."""
+    return bool((CFG.get("surface") or {}).get("embed_apps", False))
+
+
+@skill("Open any application by name as a normal, separate Windows window, the way "
+       "a person would. Use show_window only when the user asks to bring it into "
+       "Iris. Args: name")
 def open_app(name):
-    from skills import surface
-    return surface.open_app_inside(name)
+    if _embed_apps():
+        from skills import surface
+        return surface.open_app_inside(name)
+    return launch_app_raw(name)
 
 
-@skill("Open absolutely anything: an app, a file, a folder, a website or a "
-       "Windows settings page. Everything is shown inside Iris's own interface, "
-       "never in a separate window. Args: target")
+@skill("Open absolutely anything as a normal Windows window: an app, a file, a "
+       "folder, a website or a Windows settings page. Websites open in real Chrome. "
+       "Args: target")
 def open_anything(target):
-    from skills import surface
-    return surface.open_anything_inside(target)
+    if _embed_apps():
+        from skills import surface
+        return surface.open_anything_inside(target)
+    raw = str(target or "").strip().strip('"')
+    if raw.lower().startswith(("http://", "https://")):
+        from skills.browser_agent import browser_open
+        return browser_open(raw)
+    return open_anything_raw(raw)
 
 
 def open_anything_raw(target):

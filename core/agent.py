@@ -6,7 +6,7 @@ import random
 import threading
 import time
 
-from core import brain, bus, memory, voice
+from core import brain, bus, connectivity, memory, offline, voice
 from core.config import CFG
 from core.persona import build_prompt
 from core.skill import run_tool, tool_schemas
@@ -17,6 +17,7 @@ import skills.laptop           # noqa: F401
 import skills.websearch        # noqa: F401
 import skills.browser_agent    # noqa: F401
 import skills.surface          # noqa: F401
+import core.recipe             # noqa: F401 - loads skills Iris wrote for herself
 
 log = logging.getLogger("iris")
 _B = CFG["brain"]
@@ -63,7 +64,19 @@ def run(user_text, confirm):
         spoken.append(sentence)
         bus.publish("say", sentence)
 
+    # Offline with no local model: still answer the common local commands.
+    if not connectivity.is_online():
+        local = offline.route(user_text, confirm)
+        if local:
+            say(local)
+            return local
+
     tools_all, tools_browser = tool_schemas(), tool_schemas("browser_")
+    if not connectivity.is_online():
+        tools_all = [item for item in tools_all
+                     if item["function"]["name"] not in offline.ONLINE_ONLY]
+        tools_browser = [item for item in tools_browser
+                         if item["function"]["name"] not in offline.ONLINE_ONLY]
     browser_mode = False        # once she starts browsing, send only the browser tools
     last_result = ""
     max_calls = int(_B.get("max_tool_calls", 3))
@@ -78,7 +91,11 @@ def run(user_text, confirm):
         if cancel.is_set():
             break
         if msg is None:
-            say("My brain's gone quiet on me. Give me a second and try that again.")
+            if not connectivity.is_online() and not brain.has_local_model():
+                say("My online brain is out of reach. I can still do local "
+                    "things like apps, volume and screenshots.")
+            else:
+                say("My brain's gone quiet on me. Give me a second and try that again.")
             break
         calls = msg.tool_calls
         if not calls:

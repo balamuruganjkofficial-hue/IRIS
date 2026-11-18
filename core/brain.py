@@ -18,7 +18,9 @@ from types import SimpleNamespace
 
 from openai import OpenAI
 
+from core import connectivity
 from core.config import CFG
+from core.skill import select_tools
 from core.text import SENT_RE
 
 log = logging.getLogger("iris")
@@ -65,10 +67,124 @@ _PROVIDERS = {
 _BAD_KEYS = {"", "none", "null", "changeme", "your_key_here",
              "your_api_key_here", "sk-..."}
 
+# Discovery ranking. Bigger, newer general models make better assistants than
+# tiny or code-only ones, and some families are consistently strong at tools.
+_STRONG_HINTS = ("ultra", "super", "pro", "max", "large", "reason", "thinking",
+                 "r1", "instruct", "70b", "120b", "235b", "550b", "27b", "31b",
+                 "32b")
+_WEAK_HINTS = ("nano", "tiny", "small", "1.7b", "2b", "3b", "4b", "7b", "8b",
+               "flash", "preview", "guard", "code", "embed")
+_FAMILY_BONUS = {"google/": 6, "nvidia/": 6, "deepseek/": 5,
+                 "inclusionai/": 5, "thinkingmachines/": 5, "baidu/": 4,
+                 "meta-llama/": 4, "qwen/": 4, "mistralai/": 3, "cohere/": 2}
+
 _CLIENTS = {}
 _CLIENT_LOCK = threading.Lock()
 _OR_LOCK = threading.Lock()
 _OR_CACHE = {"at": 0.0, "models": []}
+_GROQ_LOCK = threading.Lock()
+_GROQ_CACHE = {"at": 0.0, "models": []}
+
+# Groq exposes speech, guard and embedding models on the same endpoint. Only
+# chat models can answer a conversation, so everything else is filtered out.
+_GROQ_SKIP = ("whisper", "orpheus", "guard", "safeguard", "tts", "embed",
+              "rerank", "moderation", "audio", "vision")
+
+# Per-model cooldown. Groq limits tokens per minute per model, so one model
+# being limited must not disable the other free models on the same provider.
+_MODEL_UNTIL = {}
+_MODEL_LOCK = threading.Lock()
+
+# Per-provider circuit breaker. Two failures inside BREAKER_WINDOW open the
+# circuit for 60 s; each later trip doubles that, capped at 15 min. Open
+# providers are skipped without creating clients, so a dead endpoint costs
+# almost nothing while the other free models still answer.
+BREAKER_FAILURES = 2
+BREAKER_WINDOW = 90.0
+BREAKER_BASE = 60.0
+BREAKER_MAX = 900.0
+_BREAKERS = {}
+_BREAKER_LOCK = threading.RLock()
+
+
+def breaker_state(provider):
+    """Read-only snapshot, including whether the circuit is open right now."""
+    with _BREAKER_LOCK:
+        item = _BREAKERS.get(provider) or {}
+        remaining = max(0.0, float(item.get("open_until", 0.0)) - time.time())
+        return {"level": int(item.get("level", 0)), "remaining": remaining,
+                "open": remaining > 0.0,
+                "failures": len(item.get("fails", []))}
+
+
+def breaker_trip(provider):
+    """True while this provider should be skipped."""
+    with _BREAKER_LOCK:
+        item = _BREAKERS.get(provider)
+        return bool(item and float(item.get("open_until", 0.0)) > time.time())
+
+
+def breaker_fail(provider):
+    """Record a failure and open (or back off) the circuit when warranted."""
+    now = time.time()
+    with _BREAKER_LOCK:
+        item = _BREAKERS.setdefault(
+            provider, {"fails": [], "open_until": 0.0, "level": 0})
+        expired = 0.0 < float(item["open_until"]) <= now
+        item["fails"] = [stamp for stamp in item["fails"]
+                         if now - stamp <= BREAKER_WINDOW]
+        item["fails"].append(now)
+        if expired or len(item["fails"]) >= BREAKER_FAILURES:
+            item["level"] += 1
+            wait = min(BREAKER_MAX, BREAKER_BASE * (2 ** (item["level"] - 1)))
+            item["open_until"] = now + wait
+            item["fails"] = []
+        return breaker_state(provider)
+
+
+def breaker_ok(provider):
+    """A successful call clears that provider's failure history."""
+    with _BREAKER_LOCK:
+        _BREAKERS.pop(provider, None)
+
+
+def breaker_hold(provider, seconds):
+    """Skip a provider for a known period, e.g. a daily free-tier reset."""
+    now = time.time()
+    with _BREAKER_LOCK:
+        item = _BREAKERS.setdefault(
+            provider, {"fails": [], "open_until": 0.0, "level": 0})
+        item["open_until"] = max(float(item.get("open_until", 0.0)),
+                                 now + max(1.0, float(seconds or 1.0)))
+        item["fails"] = []
+        return breaker_state(provider)
+
+
+def model_cooling(provider, model):
+    """True while this one model is rate limited and should be skipped."""
+    with _MODEL_LOCK:
+        return _MODEL_UNTIL.get((provider, model), 0.0) > time.time()
+
+
+def cool_model(provider, model, seconds):
+    """Park one limited model without touching the rest of its provider."""
+    until = time.time() + max(1.0, float(seconds or 1.0))
+    with _MODEL_LOCK:
+        key = (provider, model)
+        _MODEL_UNTIL[key] = max(_MODEL_UNTIL.get(key, 0.0), until)
+    return _MODEL_UNTIL[(provider, model)]
+
+
+def reset_breakers():
+    with _BREAKER_LOCK:
+        _BREAKERS.clear()
+    with _MODEL_LOCK:
+        _MODEL_UNTIL.clear()
+
+
+def has_local_model():
+    """True when an opt-in Ollama model is configured for offline use."""
+    return any(str(model).strip() for model in (_M.get("ollama_models") or []))
 
 
 # ------------------------------------------------------------------ providers
@@ -104,6 +220,30 @@ def _client(provider):
         return client
 
 
+def _model_rank(mid, context_length=0):
+    """Higher is better for a general-purpose voice assistant."""
+    text = str(mid or "").lower()
+    score = 0
+    for hint in _STRONG_HINTS:
+        if hint in text:
+            score += 3
+    for hint in _WEAK_HINTS:
+        if hint in text:
+            score -= 2
+    for prefix, bonus in _FAMILY_BONUS.items():
+        if text.startswith(prefix):
+            score += bonus
+    try:
+        context = int(context_length or 0)
+    except (TypeError, ValueError):
+        context = 0
+    if context >= 200000:
+        score += 2
+    elif 0 < context < 16000:
+        score -= 4
+    return score
+
+
 def _openrouter_models(limit=4):
     """Live list of OpenRouter models that are both free and tool-capable.
 
@@ -123,6 +263,8 @@ def _openrouter_models(limit=4):
         fresh = now - float(_OR_CACHE["at"]) < 3600
     if cached and fresh:
         return cached[:limit]
+    if not connectivity.is_online():
+        return cached[:limit]          # no network, no discovery call
 
     try:
         import requests
@@ -133,7 +275,7 @@ def _openrouter_models(limit=4):
         log.debug("OpenRouter free-model discovery failed: %s", e)
         return cached[:limit]
 
-    ids = []
+    ids, contexts = [], {}
     for model in data:
         mid = str(model.get("id") or "")
         if not mid.endswith(":free"):
@@ -141,15 +283,15 @@ def _openrouter_models(limit=4):
         if "tools" not in (model.get("supported_parameters") or []):
             continue
         try:
-            if int(model.get("context_length") or 0) < 16000:
-                continue
+            context = int(model.get("context_length") or 0)
         except (TypeError, ValueError):
-            pass
+            context = 0
+        if context and context < 16000:
+            continue
         ids.append(mid)
+        contexts[mid] = context
 
-    preferred = ("google/", "meta-llama/", "qwen/", "mistralai/", "deepseek/",
-                 "nvidia/", "inclusionai/")
-    ids.sort(key=lambda mid: 0 if mid.startswith(preferred) else 1)
+    ids.sort(key=lambda mid: (-_model_rank(mid, contexts.get(mid, 0)), mid))
     models = ids[:limit]
     if models:
         with _OR_LOCK:
@@ -157,15 +299,80 @@ def _openrouter_models(limit=4):
     return models or cached[:limit]
 
 
+def _groq_models(limit=6):
+    """Live list of Groq's free chat models, so a new one is used automatically.
+
+    Groq rate limits are per model, not per account, so trying every chat model
+    is the cheapest way to survive a busy minute. The list is discovered from
+    the models endpoint and cached for an hour. A static
+    ``models.groq_models`` list overrides discovery.
+    """
+    limit = max(1, int(limit or 6))
+    configured = [str(m).strip() for m in (_M.get("groq_models") or [])
+                  if str(m).strip()]
+    if configured:
+        return configured[:limit]
+
+    now = time.time()
+    with _GROQ_LOCK:
+        cached = list(_GROQ_CACHE["models"])
+        fresh = now - float(_GROQ_CACHE["at"]) < 3600
+    if cached and fresh:
+        return cached[:limit]
+    if not connectivity.is_online():
+        return cached[:limit]
+
+    key = _key("groq")
+    if not key:
+        return []
+    try:
+        import requests
+        response = requests.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": "Bearer " + key}, timeout=4)
+        response.raise_for_status()
+        data = response.json().get("data") or []
+    except Exception as e:  # noqa: BLE001 - discovery is best effort
+        log.debug("Groq free-model discovery failed: %s", e)
+        return cached[:limit]
+
+    ids, contexts = [], {}
+    for model in data:
+        mid = str(model.get("id") or "")
+        low = mid.lower()
+        if not mid or any(skip in low for skip in _GROQ_SKIP):
+            continue
+        try:
+            size = int(model.get("context_window") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        ids.append(mid)
+        contexts[mid] = size
+
+    ids.sort(key=lambda mid: (-_model_rank(mid, contexts.get(mid, 0)), mid))
+    models = ids[:limit]
+    if models:
+        with _GROQ_LOCK:
+            _GROQ_CACHE.update({"at": now, "models": models})
+    return models or cached[:limit]
+
+
 def chain():
     """Ordered (provider, model) pairs. Only free endpoints, only with keys."""
     out, seen = [], set()
+    offline = not connectivity.is_online()
 
     def add(provider, model):
         provider = str(provider or "").strip().lower()
         model = str(model or "").strip()
         if not provider or not model or (provider, model) in seen:
             return
+        if offline and provider != "ollama":
+            return                          # offline: local model or nothing
+        if breaker_trip(provider):
+            return                          # circuit open: skip, do not connect
+        if model_cooling(provider, model):
+            return                          # this model is limited right now
         if provider not in _PROVIDERS:
             log.warning("unknown model provider %r, skipping", provider)
             return
@@ -189,18 +396,25 @@ def chain():
         elif isinstance(entry, str):
             add("groq", entry)
 
-    # 3. OpenRouter's current free, tool-capable models.
-    if bool(_M.get("openrouter_free", True)) and _key("openrouter"):
-        for model in _openrouter_models(_M.get("openrouter_max", 4)):
+    # 3. Every other free Groq chat model. Groq limits per model, so this is
+    #    the fastest fallback when one model's tokens-per-minute runs out.
+    if (not offline and bool(_M.get("groq_free", True)) and _key("groq")):
+        for model in _groq_models(_M.get("groq_max", 6)):
+            add("groq", model)
+
+    # 4. OpenRouter's current free, tool-capable models.
+    if (not offline and bool(_M.get("openrouter_free", True))
+            and _key("openrouter")):
+        for model in _openrouter_models(_M.get("openrouter_max", 10)):
             add("openrouter", model)
 
-    # 4. Other free tiers, only when their key exists.
+    # 5. Other free tiers, only when their key exists.
     add("gemini", _M.get("gemini_model", "gemini-2.5-flash"))
     add("cerebras", _M.get("cerebras_model", "llama-3.3-70b"))
     add("mistral", _M.get("mistral_model", "mistral-small-latest"))
     add("github", _M.get("github_model", "openai/gpt-4o-mini"))
 
-    # 5. A local Ollama is free and needs no key, but is opt-in.
+    # 6. A local Ollama is free and needs no key, but is opt-in.
     for model in _M.get("ollama_models") or []:
         add("ollama", model)
     return out
@@ -240,6 +454,65 @@ def _transient(err):
             or "Timeout" in name or "Connection" in name or "APIError" in name)
 
 
+_DAILY_RE = re.compile(r"free-models-per-day|per[- ]day|daily", re.I)
+_MODEL_RATE_RE = re.compile(
+    r"for model|tokens per minute|\bitpm\b|\btpm\b|requests per minute|\brpm\b",
+    re.I)
+_RESET_RE = re.compile(r"X-RateLimit-Reset'?\s*:\s*'?(\d{9,})")
+
+
+def _rate_scope(err):
+    """'account' (whole provider is out), 'model' (one model) or 'provider'."""
+    text = str(err)
+    if _DAILY_RE.search(text):
+        return "account"
+    if _MODEL_RATE_RE.search(text):
+        return "model"
+    return "provider"
+
+
+def _rate_wait(err):
+    """How long to park the thing that hit the limit, in seconds."""
+    now = time.time()
+    retry = _retry_seconds(err)
+    match = _RESET_RE.search(str(err))
+    reset = int(match.group(1)) / 1000.0 if match else 0.0
+    reset_wait = reset - now if reset > now else 0.0
+    scope = _rate_scope(err)
+    if scope == "account":
+        return min(86400.0, max(60.0, reset_wait or 3600.0))
+    if scope == "model":
+        return max(5.0, min(120.0, retry or 20.0))
+    return max(1.0, min(120.0, retry or 10.0))
+
+
+def _is_model_error(err):
+    """A bad model or an oversized request; skip it without killing the provider."""
+    return _status(err) in (400, 404, 413, 422)
+
+
+def _last_user_text(messages):
+    for message in reversed(messages or []):
+        if message.get("role") == "user":
+            return str(message.get("content") or "")
+    return ""
+
+
+def _tool_budget():
+    try:
+        return max(0, int(_B.get("groq_tool_budget", 4000)))
+    except (TypeError, ValueError):
+        return 4000
+
+
+def _tools_for(provider, tools, query):
+    """Fit the tool list into a small model's token limit, when needed."""
+    if not tools or provider != "groq":
+        return tools
+    budget = _tool_budget()
+    return select_tools(tools, budget, query) if budget else tools
+
+
 # ------------------------------------------------------------------- requests
 def _kwargs(provider, model, messages, tools, max_tokens):
     kwargs = dict(model=model, messages=messages, max_tokens=max_tokens,
@@ -252,15 +525,22 @@ def _kwargs(provider, model, messages, tools, max_tokens):
 
 
 def warmup():
-    """Open connections early and discover the current free OpenRouter models."""
+    """Open connections early and discover the current free model lists."""
+    if not connectivity.is_online():
+        return
     try:
         if _key("groq"):
             _client("groq").models.list()
     except Exception:  # noqa: BLE001 - warmup must never fail loudly
         pass
     try:
+        if bool(_M.get("groq_free", True)) and _key("groq"):
+            _groq_models(_M.get("groq_max", 6))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         if bool(_M.get("openrouter_free", True)) and _key("openrouter"):
-            _openrouter_models(_M.get("openrouter_max", 4))
+            _openrouter_models(_M.get("openrouter_max", 10))
     except Exception:  # noqa: BLE001
         pass
 
@@ -283,22 +563,30 @@ def ask_stream(messages, tools=None, on_sentence=None, on_say=None,
         return None
     log.debug("free model chain: %s", " -> ".join(
         "{0}/{1}".format(p, m) for p, m in models))
+    waited_once = False
+    query = _last_user_text(messages)
 
     for pass_no in range(2):
         waits = []
         other_failure = False
         for provider, model in models:
+            if breaker_trip(provider):
+                continue                    # opened mid-chain: skip fast
+            if model_cooling(provider, model):
+                continue                    # this model is limited right now
             if time.time() > deadline:
                 log.warning("free-model time budget exhausted")
                 break
-            for attempt in range(2):
+            current_tools = _tools_for(provider, tools, query)
+            for attempt in range(3):
                 spoke = False
                 t0, first = time.time(), None
                 try:
                     client = _client(provider)
                     text, buf, calls = "", "", {}
                     stream = client.chat.completions.create(
-                        **_kwargs(provider, model, messages, tools, max_tokens))
+                        **_kwargs(provider, model, messages, current_tools,
+                                  max_tokens))
                     for chunk in stream:
                         if cancelled():
                             break
@@ -351,8 +639,10 @@ def ask_stream(messages, tools=None, on_sentence=None, on_say=None,
                              provider, model,
                              first if first is not None else 0, time.time() - t0)
                     if text.strip() or tool_calls or cancelled():
+                        breaker_ok(provider)
                         return SimpleNamespace(content=text, tool_calls=tool_calls)
                     log.warning("%s/%s returned an empty reply", provider, model)
+                    cool_model(provider, model, 30)
                     other_failure = True
                     break
                 except Exception as e:  # noqa: BLE001 - try the next free model
@@ -364,17 +654,44 @@ def ask_stream(messages, tools=None, on_sentence=None, on_say=None,
                     if spoke:
                         return None          # already said something; do not restart
                     if _is_rate(e):
-                        waits.append(_retry_seconds(e) or 10.0)
-                        break                # this provider is limited; next model
+                        scope = _rate_scope(e)
+                        wait = _rate_wait(e)
+                        if scope == "account":
+                            # The whole provider is out (e.g. OpenRouter's
+                            # free-models-per-day cap): skip it until reset.
+                            breaker_hold(provider, wait)
+                        elif scope == "model":
+                            # One model's tokens-per-minute ran out; the other
+                            # models on the same provider are still fine.
+                            cool_model(provider, model, wait)
+                            waits.append(wait)
+                        else:
+                            breaker_fail(provider)
+                            waits.append(wait)
+                        break                # next free model
+                    if _is_model_error(e):
+                        # A model that cannot take this request (bad model or
+                        # HTTP 413 "too large"). Shrink the tool list and retry
+                        # once, then skip this model without hurting the provider.
+                        if _status(e) == 413 and current_tools:
+                            smaller = select_tools(
+                                current_tools, max(1200, _tool_budget() // 2),
+                                query)
+                            if len(smaller) < len(current_tools):
+                                current_tools = smaller
+                                continue
+                        break
+                    breaker_fail(provider)
                     other_failure = True
                     if attempt == 0 and _transient(e):
                         time.sleep(0.3)
                         continue
                     break
 
-        if (pass_no == 0 and waits and not other_failure
+        if (pass_no == 0 and not waited_once and waits and not other_failure
                 and min(waits) <= 15 and time.time() < deadline):
             wait = min(waits) + 0.5
+            waited_once = True
             print("[brain] every free model is limited, waiting {0:.0f}s".format(wait))
             if on_sentence:
                 on_sentence("One moment.")

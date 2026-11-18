@@ -12,19 +12,67 @@ persona:
   idle_gap_minutes: 45 # minimum gap between two idle lines
   idle_lines: []       # optional custom lines, {call} is replaced
 models:
-  llm: openai/gpt-oss-20b
+  # Strong free tool-calling models. Groq is the fast primary; OpenRouter's
+  # current :free models are discovered live and used as the second tier.
+  llm: qwen/qwen3.8-27b
   fallback: openai/gpt-oss-120b
   # Extra free models. Any OpenAI-compatible provider with a key in .env works:
   # groq, openrouter, gemini, cerebras, mistral, github, ollama.
-  free_fallbacks: []
-  openrouter_free: true      # auto-discover free, tool-capable OpenRouter models
+  free_fallbacks:
+    - {provider: groq, model: openai/gpt-oss-20b}
+  # Groq limits are per model, so every free chat model is tried in turn when
+  # one runs out of tokens per minute. Set groq_models to pin an exact list.
+  groq_free: true
+  groq_models: []
+  groq_max: 6
+  # OpenRouter's free tier has a 50-request-per-day account cap. When that is
+  # hit the whole provider is skipped until the reset, and the Groq models
+  # above keep answering. Every free, tool-capable model is used when available.
+  openrouter_free: true
   openrouter_models: []      # optional fixed :free IDs, overrides discovery
-  openrouter_max: 4
+  openrouter_max: 10
   gemini_model: gemini-2.5-flash
   cerebras_model: llama-3.3-70b
   mistral_model: mistral-small-latest
   github_model: openai/gpt-4o-mini
   ollama_models: []          # opt-in local models, e.g. [llama3.2]
+
+# How much she is allowed to act and speak on her own. She still asks for
+# anything risky; this only controls unprompted, useful lines and choices.
+autonomy:
+  enabled: true
+  idle_minutes: 20           # silence before she considers speaking first
+  cooldown_minutes: 40       # minimum gap between two unprompted lines
+  max_per_hour: 3            # hard cap, so she never nags
+  check_minutes: 8           # minimum gap between model decisions
+  model_decides: true        # the free model chooses whether and what to say
+
+# Bad-internet behaviour: bounded DNS plus Cloudflare DoH fallback, and a
+# connectivity monitor that publishes offline/online only when it changes.
+network:
+  dns:
+    cache_seconds: 300        # positive answers live 5 minutes
+    negative_seconds: 30      # failures are cached briefly, no repeated spam
+    system_timeout: 1.0       # max seconds waiting on the OS resolver
+    doh_timeout: 1.5          # max seconds for the free DoH query
+    doh_ip: 1.1.1.1           # IP literal, so DoH itself never needs DNS
+    doh_tls_host: cloudflare-dns.com
+  connectivity:
+    interval: 20.0            # seconds between checks while online
+    offline_interval: 10.0    # faster retry while offline
+    timeout: 1.2              # per-host TCP connect timeout
+    hosts:                    # at least one must answer for Iris to go online
+      - [1.1.1.1, 443]
+      - [api.groq.com, 443]
+      - [openrouter.ai, 443]
+
+# Per-turn latency tracing (one CSV row per turn, rotated at 1 MB).
+latency:
+  enabled: true            # write timings to logs/latency.csv
+  log: logs/latency.csv    # previous file becomes logs/latency.1.csv on rotation
+  max_bytes: 1048576       # rotate at 1 MB
+  report_turns: 50         # default --last for python -m scripts.latency_report
+
 brain:
   max_tokens: 400
   temperature: 0.7
@@ -32,13 +80,50 @@ brain:
   max_tool_calls: 3
   request_timeout: 20
   fallback_budget: 50
+  # Groq's free tier allows only a few thousand input tokens per minute. The
+  # full tool list is larger than that, so for Groq she sends the most useful
+  # tools up to this rough budget instead of failing with HTTP 413.
+  groq_tool_budget: 4000
 voice:
-  tts_voice: en-GB-SoniaNeural
-  rate: +8%
-  pitch: +0Hz
+  # Ava is Edge's most expressive free Copilot voice: warm and conversational.
+  # Run scripts/voice_audition.py to hear the other free voices before changing.
+  tts_voice: en-US-AvaMultilingualNeural
+  rate: +2%                    # base rate; the style range clamps the result
+  pitch: +0Hz                  # base pitch; the style range clamps the result
+  style: warm                  # calm | warm | energetic
   prosody: true                # subtle per-phrase pitch/rate variation
-  rate_jitter: 4               # ± percent
-  pitch_jitter: 3              # ± Hz
+  rate_jitter: 4               # +/- percent
+  pitch_jitter: 3              # +/- Hz
+  speakable: true              # say numbers, times, URLs and markdown properly
+  pronunciations:              # words the TTS would otherwise spell out
+    SQL: sequel
+    JSON: jason
+    GUI: gooey
+    API: A P I
+    URL: U R L
+    HTTP: H T T P
+    AI: A I
+    CPU: C P U
+    GPU: G P U
+    SSD: S S D
+    USB: U S B
+    OS: O S
+  engine: auto                 # auto | edge | offline
+  edge_retries: 2              # extra attempts per sentence before the offline voice
+  edge_connect_timeout: 6.0    # websocket connect budget in seconds
+  edge_first_audio_cold: 8.0   # first audio after a cold connection
+  edge_first_audio_warm: 5.0   # first audio when Edge was used recently
+  edge_total_budget: 20.0      # give up on one sentence after this many seconds
+  edge_cold_after: 300.0       # seconds without a success before "cold"
+  edge_down_after: 3           # real network failures before switching offline
+  edge_down_window: 60.0       # those failures must happen within this window
+  edge_probe_interval: 20.0    # while offline, probe Edge this often
+  offline_engine: sapi         # sapi | kokoro (kokoro is opt-in, see CHANGES.md)
+  kokoro_model: models/kokoro-v1.0.int8.onnx
+  kokoro_voices: models/voices-v1.0.bin
+  kokoro_voice: af_heart
+  kokoro_speed: 1.0
+  kokoro_max_rtf: 1.5          # refuse Kokoro if slower than 1.5x real time
   stt_language: en-US
   stt_models:
     - whisper-large-v3-turbo
@@ -50,6 +135,13 @@ voice:
   wake_threshold: 0.35
   barge_in: true
   barge_in_threshold: 0.85
+  barge_in_mode: voice         # voice | wake | off (Esc always works)
+  barge_in_ratio: 2.2          # how much louder than her echo counts as you
+  barge_in_min_rms: 500        # never barge in below this absolute level
+  barge_in_learn: 1.0          # seconds of her own voice used as the baseline
+  barge_in_hold: 0.3           # seconds you must stay louder before she stops
+  barge_in_keep: 0.6           # seconds kept so your first word is not lost
+  barge_in_debug: false        # print the echo baseline and threshold
   vosk_model: data/vosk/vosk-model-small-en-us-0.15
   vosk_download: true
   vosk_url: https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
@@ -59,6 +151,14 @@ voice:
   chime: true
   cache_chars: 90
   cache_files: 400
+  offline_voice: Zira          # female SAPI voice; Zira matches en-US Ava
+# Skills Iris writes for herself. A recipe is data, not code: it may only call
+# tools that already exist, and every risky step still asks for confirmation.
+skills:
+  enabled: true                # load saved recipes from the folder below
+  folder: ''                   # empty = data/skills
+  max_steps: 8                 # steps allowed in one generated skill
+  max_recipes: 50              # hard cap on saved recipes
 memory:
   recent_turns: 4
   recalled_facts: 3
@@ -69,13 +169,13 @@ permissions:
   attempts: 2
   click_fallback: true
 browser:
-  headless: true
-  show_in_ui: true
+  headless: false            # Chrome is visible; Iris drives it over DevTools
+  show_in_ui: false          # no built-in browser panel by default
   capture_quality: 70
   capture_width: 1280
   keep_shots: 40
   local_files: true
-  external_chrome: false
+  external_chrome: true      # use the real Chrome, not a bundled browser
 web:
   max_results: 6
   show_in_ui: true
@@ -84,12 +184,18 @@ surface:
   ratio: 0.70
   max_tabs: 5
   live_fps: 6
-  embed_apps: true
+  embed_apps: false          # open apps as normal windows, not mirrored panes
   park_windows: true
 paths:
   workspace: ''
 chrome:
-  default_profile: ''
+  enabled: true
+  debug_port: 9222           # loopback DevTools port
+  user_data_dir: iris        # iris | system | an explicit folder
+  profile_directory: ''      # e.g. Profile 2 when using the system profile
+  default_profile: ''        # alias from the profiles map below
+  close_existing: false      # never close a running Chrome without permission
+  start_timeout: 12.0
   profiles:
     balamurugan: Profile 2
     balamuruganjkofficial: Profile 5
@@ -102,6 +208,8 @@ ui:
   height: 700
   fps: 30
   always_on_top: false
+  avatar: true                # floating Iris that lives outside the main window
+  avatar_size: 118
   cyber: true
   surface_ratio: 0.70
   bg: '#0C0509'

@@ -1,15 +1,19 @@
 """Unit tests for the pure parts of Iris. Run with:  python -m unittest discover -s tests"""
 
 import os
+import random
+import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from core import memory, net
 from core.config import CFG, ROOT
-from core.skill import REGISTRY, run_tool, skill, tool_schemas
+from core.skill import (REGISTRY, run_tool, select_tools, skill,
+                        tool_schemas)
 from core.text import (answer, clean, is_junk, just_thanks, prosody, sentences,
-                       wants_sleep)
+                       speakable, style_bounds, wants_sleep)
 
 
 class TestText(unittest.TestCase):
@@ -47,12 +51,24 @@ class TestText(unittest.TestCase):
         self.assertEqual(first, prosody("Hello there.", "+8%", "+0Hz", 4, 3))
         self.assertNotEqual(first, prosody("Different line.", "+8%", "+0Hz", 4, 3))
         for rate, pitch in (first, prosody("x", "+8%", "+0Hz", 4, 3)):
-            self.assertGreaterEqual(int(rate.rstrip("%")), 4)
-            self.assertLessEqual(int(rate.rstrip("%")), 12)
+            self.assertGreaterEqual(int(rate.rstrip("%")), 5)
+            self.assertLessEqual(int(rate.rstrip("%")), 13)
             self.assertGreaterEqual(int(pitch.rstrip("Hz")), -3)
             self.assertLessEqual(int(pitch.rstrip("Hz")), 3)
         self.assertEqual(prosody("x", "+8%", "+0Hz", 4, 3, enabled=False),
                          ("+8%", "+0Hz"))
+
+    def test_prosody_follows_punctuation(self):
+        question = prosody("Ready?", "+8%", "+0Hz", 0, 0)
+        statement = prosody("This is a line.", "+8%", "+0Hz", 0, 0)
+        long_line = prosody("word " * 30, "+8%", "+0Hz", 0, 0)
+        short_line = prosody("Go.", "+8%", "+0Hz", 0, 0)
+        self.assertEqual(question[1], "+3Hz")
+        self.assertEqual(statement[1], "+0Hz")
+        self.assertLess(int(long_line[0].rstrip("%")),
+                        int(statement[0].rstrip("%")))
+        self.assertGreater(int(short_line[0].rstrip("%")),
+                           int(statement[0].rstrip("%")))
 
     def test_spoken_yes(self):
         for phrase in ("yes", "yeah", "yep", "sure", "go ahead", "do it",
@@ -67,6 +83,91 @@ class TestText(unittest.TestCase):
     def test_spoken_unclear(self):
         for phrase in ("maybe later", "what do you mean", "", "hmm"):
             self.assertIsNone(answer(phrase), phrase)
+
+
+class TestSpeakable(unittest.TestCase):
+    def test_numbers_percent_and_currency(self):
+        self.assertEqual(speakable("I have 3 cats and 12 dogs."),
+                         "I have three cats and twelve dogs.")
+        self.assertEqual(speakable("It is 20% done and costs $1.50."),
+                         "It is twenty percent done and costs one dollar and "
+                         "fifty cents.")
+
+    def test_times_are_said_not_spelled(self):
+        self.assertEqual(speakable("Call at 9:30pm, or 17:45."),
+                         "Call at nine thirty p m, or five forty-five p m.")
+        self.assertEqual(speakable("The meeting is at 9:00."),
+                         "The meeting is at nine o'clock.")
+
+    def test_dates_and_units(self):
+        self.assertEqual(speakable("The date is 2026-11-18."),
+                         "The date is November eighteenth, twenty twenty-six.")
+        self.assertEqual(speakable("It is 5km and 20 degrees."),
+                         "It is five kilometres and twenty degrees.")
+
+    def test_urls_paths_markdown_and_emoji_are_removed(self):
+        self.assertEqual(speakable("Read https://example.com/foo now."),
+                         "Read now.")
+        self.assertEqual(speakable("Open C:\\Users\\me\\secret.txt please."),
+                         "Open please.")
+        self.assertEqual(speakable("**Hello** `world` :)"), "Hello world")
+
+    def test_abbreviations_and_pronunciations(self):
+        self.assertEqual(speakable("Use SQL and JSON, e.g. this."),
+                         "Use sequel and jason, for example this.")
+        self.assertEqual(speakable("Say SQL.", {"SQL": "S Q L"}), "Say S Q L.")
+
+    def test_ellipsis_becomes_a_pause(self):
+        self.assertEqual(speakable("First... then second."),
+                         "First, then second.")
+
+    def test_long_sentence_is_split_at_commas(self):
+        long_line = ("This is a very long sentence, with several commas, that "
+                     "keeps going on and on, because it was written by a model "
+                     "that never learned to stop talking, and it really should "
+                     "be split into pieces so the voice can breathe.")
+        spoken = speakable(long_line)
+        self.assertGreaterEqual(len(re.findall(r"[.!?]", spoken)), 2)
+        for piece in re.split(r"(?<=[.!?])\s+", spoken):
+            self.assertLessEqual(len(piece.split()), 26, piece)
+
+    def test_empty_and_garbage_input_is_safe(self):
+        self.assertEqual(speakable(""), "")
+        self.assertEqual(speakable(None), "")
+        self.assertIsInstance(speakable("..."), str)
+
+    def test_prosody_strings_are_always_valid(self):
+        rng = random.Random(7)
+        words = ("hi", "there", "why", "now", "okay", "please", "explain",
+                 "battery", "twenty", "Chrome", "logs", "again")
+        endings = ("", ".", "?", "!", "...")
+        rates = ("+0%", "+2%", "+5%", "-3%", "+8%", "abc", "")
+        pitches = ("+0Hz", "-2Hz", "+3Hz", "+-1Hz", "garbage")
+        for style in (None, "calm", "warm", "energetic", "nonsense"):
+            for _ in range(400):
+                text = (" ".join(rng.choice(words)
+                                 for _ in range(rng.randint(0, 40))) +
+                        rng.choice(endings))
+                rate, pitch = prosody(
+                    text, rng.choice(rates), rng.choice(pitches),
+                    rng.randint(0, 10), rng.randint(0, 10),
+                    rng.choice((True, False)), style)
+                self.assertRegex(rate, r"^[+-]\d+%$")
+                self.assertRegex(pitch, r"^[+-]\d+Hz$")
+
+    def test_styles_clamp_rate_and_pitch(self):
+        for style in ("calm", "warm", "energetic"):
+            low_r, high_r, low_p, high_p = style_bounds(style)
+            for enabled in (True, False):
+                for _ in range(50):
+                    rate, pitch = prosody("Ready?", "+20%", "+15Hz", 10, 10,
+                                          enabled, style)
+                    self.assertRegex(rate, r"^[+-]\d+%$")
+                    self.assertRegex(pitch, r"^[+-]\d+Hz$")
+                    self.assertGreaterEqual(int(rate.rstrip("%")), low_r)
+                    self.assertLessEqual(int(rate.rstrip("%")), high_r)
+                    self.assertGreaterEqual(int(pitch.rstrip("Hz")), low_p)
+                    self.assertLessEqual(int(pitch.rstrip("Hz")), high_p)
 
 
 class TestNet(unittest.TestCase):
@@ -124,6 +225,45 @@ class TestSkills(unittest.TestCase):
         self.assertIn("unknown tool", result)
 
 
+class TestToolBudget(unittest.TestCase):
+    """Small free models get a relevant subset instead of an oversized request."""
+
+    @staticmethod
+    def _tool(name, description):
+        return {"type": "function", "function": {
+            "name": name, "description": description,
+            "parameters": {"type": "object", "properties": {}}}}
+
+    def test_zero_budget_keeps_everything(self):
+        items = [self._tool("a", "x" * 400), self._tool("b", "y" * 400)]
+        self.assertEqual(select_tools(items, 0), items)
+        self.assertEqual(select_tools(items, None), items)
+
+    def test_small_budget_keeps_the_matching_tool(self):
+        items = [self._tool("open_chrome", "Open Chrome."),
+                 self._tool("take_screenshot", "Grab the screen."),
+                 self._tool("volume", "Change the volume.")]
+        chosen = select_tools(items, 70, "open chrome please")
+        names = [item["function"]["name"] for item in chosen]
+        self.assertIn("open_chrome", names)
+        self.assertLess(len(chosen), len(items))
+
+    def test_core_tools_survive_a_tight_budget(self):
+        items = [self._tool("open_app", "Open an app."),
+                 self._tool("system_info", "Battery and RAM."),
+                 self._tool("rare_tool", "Something obscure.")]
+        names = [item["function"]["name"]
+                 for item in select_tools(items, 130, "hello")]
+        self.assertIn("open_app", names)
+        self.assertIn("system_info", names)
+
+    def test_budget_is_actually_respected(self):
+        items = [self._tool("tool_%d" % i, "d" * 300) for i in range(40)]
+        chosen = select_tools(items, 500, "anything")
+        self.assertLess(len(chosen), len(items))
+        self.assertGreaterEqual(len(chosen), 1)
+
+
 class TestMemory(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -163,6 +303,15 @@ class TestMemory(unittest.TestCase):
 
 
 class TestBrainFallback(unittest.TestCase):
+    def setUp(self):
+        from core import brain, connectivity
+        brain.reset_breakers()
+        connectivity.reset_for_tests(True)
+
+    def tearDown(self):
+        from core import brain
+        brain.reset_breakers()
+
     def test_status_and_rate(self):
         from core import brain
 
@@ -192,8 +341,10 @@ class TestBrainFallback(unittest.TestCase):
         ]
         try:
             with mock.patch.object(brain, "_key", lambda provider: "test"), \
+                    mock.patch.object(brain, "_groq_models",
+                                      lambda limit=6: []), \
                     mock.patch.object(brain, "_openrouter_models",
-                                      lambda limit=4: ["google/gemma-4-31b-it:free"]):
+                                      lambda limit=10: ["google/gemma-4-31b-it:free"]):
                 models = brain.chain()
         finally:
             CFG["models"]["free_fallbacks"] = old
@@ -335,6 +486,52 @@ class TestPersona(unittest.TestCase):
         self.assertNotIn("None", prompt)
         self.assertNotIn("{", prompt)
         self.assertNotIn("}", prompt)
+
+
+class TestModels(unittest.TestCase):
+    def test_bigger_general_models_rank_higher(self):
+        from core.brain import _model_rank
+        strong = _model_rank("nvidia/nemotron-3.5-super-vl:free", 1000000)
+        tiny = _model_rank("liquid/lfm-3-1.7b:free", 262144)
+        self.assertGreater(strong, tiny)
+
+    def test_large_context_and_known_families_get_a_bonus(self):
+        from core.brain import _model_rank
+        good = _model_rank("google/gemma-4-31b-it:free", 200000)
+        weak = _model_rank("unknown/nano:free", 8000)
+        self.assertGreater(good, weak)
+
+    def test_tiny_models_lose_points(self):
+        from core.brain import _model_rank
+        self.assertLess(_model_rank("someone/tiny-2b:free", 4000),
+                        _model_rank("someone/tiny-2b:free", 400000))
+
+
+class TestChrome(unittest.TestCase):
+    def test_profile_nicknames_resolve(self):
+        from skills import browser_agent
+        cfg = {"profiles": {"work": "Profile 8", "balamurugan": "Profile 2"}}
+        with mock.patch.object(browser_agent, "_chrome_cfg", lambda: cfg):
+            self.assertEqual(browser_agent._resolve_profile("work"), "Profile 8")
+            self.assertEqual(browser_agent._resolve_profile("Work"), "Profile 8")
+            self.assertEqual(browser_agent._resolve_profile("Profile 3"), "Profile 3")
+            self.assertEqual(browser_agent._resolve_profile(""), "")
+
+    def test_iris_profile_lives_under_data(self):
+        from skills import browser_agent
+        cfg = {"user_data_dir": "iris", "profile_directory": ""}
+        with mock.patch.object(browser_agent, "_chrome_cfg", lambda: cfg):
+            data, profile, label = browser_agent._target("iris")
+        self.assertEqual(label, "iris")
+        self.assertEqual(profile, "")
+        self.assertIn("chrome-profile", str(data))
+
+    def test_devtools_endpoint_is_loopback(self):
+        from skills import browser_agent
+        with mock.patch.object(browser_agent, "_chrome_cfg",
+                               lambda: {"debug_port": 9333}):
+            self.assertEqual(browser_agent._endpoint(),
+                             "http://127.0.0.1:9333")
 
 
 class TestPlatform(unittest.TestCase):

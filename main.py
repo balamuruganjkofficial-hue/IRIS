@@ -45,6 +45,11 @@ if "--doctor" in sys.argv:
     from scripts.doctor import main as doctor_main  # noqa: E402
     sys.exit(doctor_main(sys.argv))
 
+# Patch DNS before any SDK/HTTP library is imported. httpx (Groq/OpenAI),
+# requests and aiohttp (edge-tts) all call socket.getaddrinfo at runtime.
+from core import dns as _dns  # noqa: E402
+_dns.install()
+
 # Only one Iris at a time (so autostart and a manual run never fight over the mic)
 _LOCK = socket.socket()
 try:
@@ -56,7 +61,7 @@ except OSError:
 
 import psutil  # noqa: E402
 
-from core import bus  # noqa: E402
+from core import bus, connectivity, memory  # noqa: E402
 from core.config import CFG, LOGS  # noqa: E402
 
 HEADLESS = sys.stdout is None          # True when started with pythonw (no console)
@@ -150,11 +155,14 @@ _chime = bool(CFG["voice"].get("chime", True))
 _greet = True
 _last_activity = time.time()
 _last_banter = 0.0
+_initiative = None
 
 
 def _touch():
     global _last_activity
     _last_activity = time.time()
+    if _initiative is not None:
+        _initiative.note_activity()
 
 
 def chime(kind):
@@ -309,26 +317,79 @@ def greet():
     say(line)
 
 
-def _maybe_banter():
-    """One gentle, human line after a long silence - never a nag."""
-    global _last_banter
+def _idle_line():
+    """A gentle fallback line for when the model cannot decide."""
     persona = CFG.get("persona") or {}
-    if not persona.get("proactive", True):
+    lines = persona.get("idle_lines") or IDLE_LINES
+    return random.choice(lines).format(call=CALL, name=NAME, wake=WAKE)
+
+
+def _initiative_context():
+    """A short, factual snapshot for the unprompted decision."""
+    bits = []
+    silence = max(0.0, (time.time() - _last_activity) / 60.0)
+    bits.append("He has been quiet for about {0:.0f} minutes.".format(silence))
+    try:
+        battery = psutil.sensors_battery()
+        if battery is not None:
+            bits.append("Battery {0:.0f}%{1}.".format(
+                battery.percent, " charging" if battery.power_plugged else ""))
+        bits.append("Memory {0:.0f}% used.".format(
+            psutil.virtual_memory().percent))
+    except Exception:  # noqa: BLE001 - hardware data is a bonus, not a need
+        pass
+    try:
+        turns = memory.recent(4)
+    except Exception:  # noqa: BLE001
+        turns = []
+    if turns:
+        bits.append("Recent conversation:\n" + "\n".join(
+            "{0}: {1}".format(turn["role"], turn["content"])[:200]
+            for turn in turns))
+    return "\n".join(bits)
+
+
+def _run_initiative_tool(name, args):
+    """Run only safe, automatic tools chosen by Iris herself."""
+    from core import initiative as _auto
+    from core.skill import REGISTRY, run_tool
+    spec = REGISTRY.get(name)
+    if spec is None or spec["level"] != 1 or not _auto.safe_tool(name):
+        bus.publish("toast", "I thought better of that one.")
+        return None
+    _ok, result = run_tool(name, args, confirm)
+    return result
+
+
+def _maybe_initiative():
+    """Let Iris decide, on her own, whether one useful thing is worth doing."""
+    persona = CFG.get("persona") or {}
+    if not persona.get("proactive", True) or _initiative is None:
         return False
     if ears.mode() != "idle" or voice.is_speaking():
         return False
-    now = time.time()
-    idle = max(5.0, float(persona.get("idle_minutes", 25))) * 60
-    gap = max(10.0, float(persona.get("idle_gap_minutes", 45))) * 60
-    if now - _last_activity < idle or now - _last_banter < gap:
+    try:
+        decision = _initiative.maybe(
+            context=_initiative_context(),
+            facts=memory.facts()[-3:],
+            fallback=_idle_line)
+    except Exception:  # noqa: BLE001 - initiative must never break the loop
+        logging.exception("initiative failed")
         return False
-    lines = persona.get("idle_lines") or IDLE_LINES
-    line = random.choice(lines).format(call=CALL, name=NAME, wake=WAKE)
-    _last_banter = now
-    _touch()
-    print("[iris] idle line")
-    say(line)
-    voice.wait_done()
+    if not decision:
+        return False
+    line = str(decision.get("say") or "").strip()
+    tool = decision.get("tool")
+    args = decision.get("args") or {}
+    if line:
+        print("[iris] unprompted: {0}".format(line))
+        say(line)
+        voice.wait_done()
+    if tool:
+        print("[iris] unprompted tool: {0} {1}".format(tool, args))
+        result = _run_initiative_tool(tool, args)
+        if result and result.startswith("ERROR"):
+            bus.publish("toast", result[:180])
     return True
 
 
@@ -371,11 +432,27 @@ def assist_loop():
     ears.flush()
     ears.set_mode("idle")
 
+    # One calm notice when the internet drops. The monitor publishes only on a
+    # real state change, so this cannot repeat every few seconds.
+    _offline_notice = {"said": False}
+
+    def _on_connectivity(payload):
+        online = (bool(payload.get("online")) if isinstance(payload, dict)
+                  else bool(payload))
+        if online:
+            _offline_notice["said"] = False
+        elif not _offline_notice["said"]:
+            _offline_notice["said"] = True
+            say("Internet's out. I'll keep the local stuff running.")
+
+    bus.subscribe("connectivity", _on_connectivity)
+    connectivity.start()
+
     while not _quit.is_set():
         try:
             kind, payload = ears.events.get(timeout=0.5)
         except queue.Empty:
-            _maybe_banter()
+            _maybe_initiative()
             continue
         _touch()
         try:
@@ -441,6 +518,10 @@ def shutdown(*_):
     print("[iris] shutting down")
     try:
         voice.stop()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        connectivity.stop()
     except Exception:  # noqa: BLE001
         pass
     if _ui is not None:
@@ -530,7 +611,7 @@ def start_ui():
 
 
 def main(argv=None):
-    global _ui, _greet
+    global _ui, _greet, _initiative
     parser = argparse.ArgumentParser(description="Iris, a local voice assistant")
     parser.add_argument("--console", action="store_true", help="terminal only")
     parser.add_argument("--no-greeting", action="store_true", help="skip the hello")
@@ -541,6 +622,8 @@ def main(argv=None):
         from scripts.doctor import main as doctor_main
         return doctor_main(argv or sys.argv)
     _greet = not args.no_greeting
+    from core.initiative import Initiative
+    _initiative = Initiative(CFG)
     wake.warmup()                       # prefetch/teach the wake word in the background
 
     use_ui = not args.console and bool(CFG.get("ui", {}).get("enabled", True))

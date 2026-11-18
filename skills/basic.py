@@ -65,34 +65,38 @@ def _resolve_profile(want):
 
 
 def _chrome(url=None, profile=""):
-    """Every browser task is shown *inside* Iris; no external Chrome window.
+    """Drive the real, visible Google Chrome window over the DevTools protocol.
 
-    The ``profile`` argument is kept so older spoken commands still work.
+    The ``profile`` argument is kept so older spoken commands still work; the
+    profile itself comes from the ``chrome`` config section.
     """
-    from skills import surface
-    return surface.open_browser(url or None)
+    from skills.browser_agent import browser_home, browser_open
+    if url:
+        return browser_open(url)
+    return browser_home()
 
 
-@skill("Open Iris's own browser inside her interface, with her start page and "
-       "search box. Use this whenever the user says 'open Chrome' or 'open the "
-       "browser'. Args: profile (optional; accepted for compatibility)")
+@skill("Open the real Google Chrome window and give Iris control of it. Use this "
+       "whenever the user says 'open Chrome' or 'open the browser'. Args: profile "
+       "(optional; accepted for compatibility)")
 def open_chrome(profile=""):
     from skills.browser_agent import browser_home
     result = browser_home()
     if result.startswith("ERROR"):
         return result
-    return "Opened my browser inside the interface."
+    return "Opened Chrome. I can see and drive the same window you do."
 
 
-@skill("Search the web and show the results page inside Iris's own browser panel. "
-       "Args: query, profile (optional; accepted for compatibility)")
+@skill("Search the web in the real Google Chrome window, showing the actual results "
+       "page there. Args: query, profile (optional; accepted for compatibility)")
 def google_search(query, profile=""):
     from skills.browser_agent import browser_search
     result = browser_search(query)
-    return result if result.startswith("ERROR") else "Searching inside my interface."
+    return result if result.startswith("ERROR") else \
+        "Searching in Chrome. The results are on screen."
 
 
-@skill("Show a website inside Iris's own browser panel. Args: url, profile "
+@skill("Open a website in the real Google Chrome window. Args: url, profile "
        "(optional; accepted for compatibility)")
 def open_website(url, profile=""):
     from skills.browser_agent import browser_open
@@ -103,7 +107,7 @@ def open_website(url, profile=""):
         url = "https://" + url
     result = browser_open(url)
     return result if result.startswith("ERROR") else \
-        "Opened {0} inside my interface.".format(url)
+        "Opened {0} in Chrome.".format(url)
 
 
 @skill("Get battery, RAM and CPU status. No args.", observe=True)

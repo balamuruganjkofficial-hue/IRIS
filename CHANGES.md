@@ -4,7 +4,9 @@
 **Scope:** bug fixes, performance work, new interface, tests, project hygiene,
 then a second pass for full laptop autonomy, voice-only permissions, in-interface
 web search and a cybernetic HUD, a third pass for the Iris wake word and the
-surface that holds everything, and a fourth pass that makes her sound human.
+surface that holds everything, a fourth pass that makes her sound human, a
+fifth pass for skills she writes herself, a warmer voice and a human avatar,
+and a sixth pass that keeps her answering when a free model hits its limit.
 **Cost:** still 100% free — no new paid services, APIs or hardware. The UI uses Python's built-in `tkinter`; speech, STT and the LLM continue to use the free tiers of Edge TTS, Google/Whisper and Groq.
 
 ---
@@ -954,3 +956,584 @@ to ASCII for cp1252 consoles.
   process. It cannot block the report or the mic loop.
 - The 1-token calls consume a tiny amount of the free-tier quota. They are
   skipped entirely when no key is configured.
+
+---
+
+## 15. Bad internet - fallbacks instead of freezes
+
+Iris now treats a bad connection as a normal condition rather than an error.
+DNS has a free safety net, dead providers are skipped quickly, the interface
+knows when the laptop is offline, and local skills keep working.
+
+### 15.1 DNS fallback
+
+New `core/dns.py` wraps `socket.getaddrinfo` once at startup. The normal system
+lookup runs first, bounded by a short daemon-thread wait. If it fails, the name
+is resolved through Cloudflare's free DNS-over-HTTPS JSON endpoint at
+`https://1.1.1.1/dns-query`, using the IP literal and the
+`cloudflare-dns.com` TLS name so the fallback never needs DNS itself.
+
+- Positive answers are cached for five minutes; failures for 30 seconds, so a
+  dead network does not trigger the same lookup on every tool call.
+- Numeric hosts bypass DNS entirely, which also keeps the DoH path and the
+  single-instance lock usable when the resolver is broken.
+- The patch is on `socket` itself, so it covers the Groq/OpenAI SDKs (httpx),
+  `requests`/urllib3 and `aiohttp`/edge-tts without changing those libraries.
+- `main.py` installs it after `--doctor` is dispatched but before the
+  third-party imports, so the doctor's offline simulation still works.
+
+### 15.2 Provider circuit breaker
+
+`core/brain.py` keeps a breaker per provider. Two failures inside 90 seconds
+open that provider's circuit for 60 seconds; each later trip doubles the wait,
+up to 15 minutes. `chain()` filters open providers before any client is
+created, so a dead endpoint costs almost nothing while the other free models
+still answer. A successful reply clears the provider's history. Rate-limit
+waits happen at most once per `ask_stream` call, so Iris says "One moment."
+once instead of repeating it.
+
+### 15.3 Connectivity monitor
+
+New `core/connectivity.py` makes short TCP probes against a few public hosts on
+a daemon thread. It publishes `connectivity` only when the state actually
+changes, so the interface and the spoken notice cannot spam. The UI shows
+`offline - local mode` while offline; `main.py` speaks one calm notice on the
+first drop and re-arms it after the connection returns.
+
+### 15.4 Offline mode
+
+When offline, `core/agent.py` first tries a small deterministic local router in
+`core/offline.py` for commands such as time, battery, volume, screenshots,
+opening local apps, notes, file reads and window lists. Online-only tools are
+hidden from the model. If `models.ollama_models` is configured, the chain uses
+only that local Ollama model; otherwise Iris says plainly that local things
+still work. Speech falls back to the built-in Windows SAPI voice, and Edge TTS
+network calls are bounded by `voice.tts_timeout`.
+
+### 15.5 Verification
+
+- `python -m compileall -q main.py core skills interfaces scripts tests` -> no
+  errors.
+- `python -m unittest discover -s tests` -> **Ran 63 tests ... OK**. New
+  `tests/test_resilience.py` simulates DNS failure, DoH success and negative
+  caching, system-resolver timeouts, `requests`/`httpx`/`aiohttp` through the
+  patched resolver, HTTP 429, timeouts and recovery. It checks that a dead
+  provider is skipped without another call, that "One moment." is said once,
+  that connectivity publishes once per change, and that the monitor is a
+  daemon and never blocks the UI.
+- Offline doctor run (temporary `sitecustomize.py` forcing DNS failure):
+  7.0 s total, exit code 0, no traceback, six network `FAIL` lines with fix
+  hints and local checks still OK.
+
+### 15.6 Limits
+
+- DoH still needs a working route to `1.1.1.1:443`; if the network blocks that
+  IP too, Iris treats the lookup as failed and uses the negative cache.
+- The OS resolver call cannot be cancelled mid-call; the wrapper stops waiting
+  after its timeout and the daemon thread dies with the process.
+- The SAPI voice is lower quality than Edge TTS. It is a fallback, not a
+  replacement.
+- Without a configured Ollama model, offline replies are limited to the local
+  command router.
+
+### 15.7 Try it by hand in under a minute
+
+Turn Wi-Fi off and say "Iris, volume up" - it should still work after one calm
+offline notice. Ask "Iris, search the web for cats" - she should say she cannot
+reach the web instead of freezing. Turn Wi-Fi back on; the status returns to
+online and the next web request works.
+
+## 16. Speech without gaps - merging, prefetch and a local voice
+
+The old voice engine synthesised one sentence at a time, so every sentence paid
+the full Edge TTS round trip and Iris audibly paused between them. `core/voice.py`
+now runs a small `SpeechPipeline` with two daemon threads: one synthesises, one
+plays. The public `speak()`, `wait_done()`, `is_speaking()`, `stop()` and
+`prewarm()` functions are unchanged, so `main.py`, the agent and the skills did
+not need to change.
+
+### 16.1 Merging and prefetch
+
+- `speak()` splits a reply at sentence boundaries and queues at most two chunks:
+  the first sentence on its own, then the rest joined. That keeps the first
+  sound fast while giving the synthesiser a large second request.
+- Anything that arrives while the synthesiser is busy is merged. `_TextQueue`
+  hands out the queued chunks of the same generation as one request, so three
+  quick sentences become one Edge call instead of three.
+- The very first chunk of an idle utterance is marked `solo` and is never merged
+  with later text. It is synthesised immediately, which is the fast path for a
+  short opener such as "Hi."
+- While the player is busy, the synthesiser is already working on the next
+  chunk, so the next clip is normally ready before the current one ends.
+
+### 16.2 Measuring the gap
+
+`GapMeter` records the time between the end of one chunk and the start of the
+next within the same generation. The player logs `tts gap N ms` for every
+consecutive pair and warns when a gap exceeds 300 ms. The meter takes an
+injectable clock, so the tests can verify it without sleeping. `stop()` resets
+it, and a new utterance resets it as well, so a gap is never reported across
+two separate replies.
+
+### 16.3 Edge budget and the Windows voice
+
+- `voice.tts_timeout` now defaults to **3.0 s** (was 8.0 s). The Edge call is
+  wrapped in `asyncio.wait_for`, so a stalled request cannot block speech.
+- On a failure or timeout, the synthesiser calls `_edge_failed()`, which marks
+  Edge as down, shows **one** toast, and sends the text to SAPI through
+  `win32com.client` (`SAPI.SpVoice`). pywin32 is already a dependency, so this
+  is free and built into Windows.
+- SAPI is used asynchronously so `stop()` can purge it. If SAPI itself is
+  unavailable, the text is skipped with a log line rather than crashing Iris.
+- `voice.edge_retry` (default 30 s) controls how long Iris stays on SAPI. After
+  that window the next chunk tries Edge again. A retry failure does **not**
+  re-toast; only a real Edge success or the connectivity monitor reporting
+  online clears the fallback state and re-arms the toast.
+- `should_use_offline_voice()` also returns true whenever the connectivity
+  monitor says Iris is offline, so the same path covers a pulled cable and a
+  slow Edge server. `prewarm()` skips network synthesis in that state.
+
+### 16.4 Barge-in and accounting
+
+The old code used `queue.join()`, which made `stop()` wait for work it had just
+cancelled. Each utterance now has a generation number and a per-generation
+pending count:
+
+- `stop()` increments the generation, drains the text and audio queues, marks
+  their pending items done, removes temporary mp3 files, resets the gap meter,
+  then stops pygame and purges SAPI.
+- `wait_done()` waits only for the current generation, so a cancelled utterance
+  cannot keep a caller blocked.
+- `is_speaking()` reads the same counter, so the interface, wake word and
+  barge-in checks stay correct after a stop.
+
+### 16.5 Verification
+
+- `python -m compileall -q main.py core skills interfaces scripts tests` -> no
+  errors.
+- `python -m unittest tests.test_voice -v` -> **Ran 9 tests ... OK**. The fake
+  TTS tests check that queued sentences merge into one request, that the first
+  short sentence stays on its own fast path, that the simulated gap stays under
+  300 ms, that the second chunk is synthesised before the first finishes
+  playing, that `GapMeter` honours an injected clock, that `stop()` returns in
+  under 50 ms with zero pending work and announces idle, that a simulated Edge
+  failure speaks through the offline voice, that the Edge budget is at most 3 s,
+  that repeated failures toast once, and that connectivity recovery clears the
+  fallback.
+- `python -m unittest discover -s tests` -> **Ran 72 tests ... OK**.
+- Offline doctor run (temporary `sitecustomize.py` forcing DNS failure):
+  6.8 s total, exit code 0, no traceback, six network `FAIL` lines with fix
+  hints and local checks still OK.
+
+### 16.6 Limits
+
+- The first sentence still needs one network round trip unless the phrase is
+  already in the disk cache or Edge is down. Prefetch only helps from the second
+  chunk onward.
+- SAPI uses whatever Windows voice is installed. It is intelligible, not
+  beautiful, and its timing is less precise than Edge.
+- Merging joins sentences with a space, so per-sentence prosody is chosen for
+  the merged text rather than for each sentence.
+- If a machine has no audio device at all, playback is skipped and logged; the
+  rest of Iris keeps running.
+
+### 16.7 Try it by hand in under a minute
+
+Ask something that makes Iris answer in several sentences. The first sentence
+should start quickly, the rest should follow without a long pause, and
+`logs/iris.log` should show `tts gap` lines below 300 ms. Then disconnect the
+network and ask again: she should say one toast about the offline voice and
+still speak. Reconnect and wait half a minute; the next reply should use Edge
+again.
+
+
+## 17. Real Chrome, a matching offline voice, stronger free models, initiative and a floating avatar
+
+### 17.1 Offline voice now matches the online Iris
+
+The Edge voice is `en-GB-SoniaNeural`. The Windows SAPI fallback used to keep
+whatever voice happened to be first, which on this laptop is David (male). The
+offline path now picks a voice deliberately:
+
+- `core/voice.py` adds `OFFLINE_VOICE_NAME` (default `Hazel`),
+  `_pick_sapi_voice()` and `_sapi_ssml()`.
+- Selection scores the installed voices: the named voice first (Microsoft Hazel
+  Desktop, en-GB female), then any British female, then any female, then
+  anything else. A male voice is never chosen while a female exists.
+- Speech is wrapped in SSML with the same `rate` and `pitch` values Edge uses,
+  and falls back to plain text if a voice rejects XML.
+- `voice.offline_voice: Hazel` is exposed in `config.yaml` and in
+  `core/config.py` defaults.
+
+### 17.2 Stronger free models, ranked instead of guessed
+
+- The primary free model is now `qwen/qwen3.8-27b` on Groq, with
+  `openai/gpt-oss-120b` as the fallback and `openai/gpt-oss-20b` as an extra
+  free fallback. All three were checked against Groq's free API with tool calls.
+- `core/brain.py` adds `_model_rank()`. OpenRouter `:free` models are filtered
+  to tool-capable IDs with a usable context window and then ranked by model
+  size, family, recency-friendly hints and context length instead of a short
+  hard-coded preference list. `openrouter_max` is now 6.
+- No paid model can enter the chain: OpenRouter IDs must still end in `:free`.
+
+### 17.3 Real Chrome, controlled over DevTools
+
+`skills/browser_agent.py` was rewritten. There is no bundled browser and no
+headless page hidden from the user any more.
+
+- Iris launches the installed Google Chrome (or attaches to a Chrome already
+  listening on a loopback DevTools port) and drives the same visible window the
+  user can see and touch.
+- The default profile is Iris' own `data/chrome-profile`, because a Chrome that
+  is already running with the system profile cannot enable the debugging port.
+  `chrome.user_data_dir: system` is supported; if Chrome is already open Iris
+  falls back to her own profile and shows one toast. `chrome.close_existing` is
+  off by default, so Iris never kills a running Chrome unasked.
+- Existing `browser_*` tool names are kept. New controls: tabs (list, new,
+  switch, close), find by text, list links, hover, wait for text or a selector,
+  JavaScript evaluation (level 2), file upload (level 2), viewport changes,
+  keyboard shortcuts, local file pages, and an optional snapshot into the UI.
+- `browser.show_in_ui` now defaults to false, so no browser panel is drawn.
+  `browser.external_chrome` is true.
+- `skills/basic.py` routes `open_chrome`, `google_search` and `open_website`
+  through the real Chrome controller.
+
+### 17.4 Apps open as normal windows again
+
+- `skills/laptop.py` `open_app` and `open_anything` now launch ordinary,
+  separate Windows windows. Websites in `open_anything` go to real Chrome.
+- `surface.embed_apps` defaults to false. `show_window` still mirrors a real
+  window into the optional surface panel when the user asks for it.
+
+### 17.5 Iris can decide for herself
+
+- New `core/initiative.py`: a small, rate-limited second loop. After a long
+  silence the free model is asked for one JSON decision:
+  `{"say": "...", "do": null}` or a safe tool call.
+- `should_consider()` is pure and enforces `autonomy.enabled`, idle time,
+  cooldown, an hourly cap and a busy flag. `parse_decision()` accepts clean
+  JSON, fenced JSON or a short plain sentence. `safe_tool()` is an allow-list of
+  ordinary, reversible actions; risky tools, JavaScript, uploads, typing,
+  clicks and shell commands are not available to the autonomous path.
+- `Initiative` also has a `check_minutes` gap, so a model that says "nothing"
+  is not called every half second. The old gentle idle line remains as a
+  fallback when the model is offline or silent.
+- `main.py` wires the initiative into the idle branch of the assistant loop. It
+  never speaks over listening, speaking or an active turn. Risky actions chosen
+  by the model are refused with a toast; ordinary tools run through the normal
+  registry and confirmation path.
+- `core/persona.py` now describes the visible Chrome window, normal app
+  windows, the floating avatar, and her freedom to decide and chain safe steps.
+
+### 17.6 The floating avatar
+
+- New `interfaces/avatar.py`: a frameless, always-on-top Toplevel with a dark
+  red orb, glow rings, rotating arcs, blinking eyes, a speaking equaliser and a
+  short caption of the last line.
+- Drag to move; the position is saved to `data/avatar_pos.json`. Click to bring
+  the main window back, double-click to start listening, right-click for Show
+  Iris, Listen, Stop speaking and Hide avatar. The main title bar also has an
+  avatar toggle, so hiding it is reversible.
+- `interfaces/ui.py` creates it when `ui.avatar` is true (default), forwards
+  state, microphone level, `say` and `reply` events, and closes it with the main
+  window. `ui.avatar_size` sets its size.
+
+### 17.7 Verification
+
+- `python -m compileall -q main.py core skills interfaces scripts tests` -> no
+  errors.
+- `python -m unittest discover -s tests` -> **Ran 99 tests ... OK**. New tests
+  cover SAPI voice selection and SSML, model ranking, Chrome profile/endpoint
+  helpers, initiative rate limits, decision parsing and the safe-tool allow
+  list.
+- Real Chrome smoke test: launched Chrome 157 with a temporary profile and a
+  loopback DevTools port, connected with Playwright `connect_over_cdp`, loaded
+  a page, read its title and text, then disconnected and closed only that
+  Chrome instance. It worked.
+- Offline doctor smoke test (resolver forced to fail): 6.7 s, exit code 0, six
+  network `FAIL` lines with fix hints, no traceback, local checks still OK.
+
+### 17.8 Limits
+
+- Chrome must have been started with `--remote-debugging-port`. If the user's
+  normal Chrome is already open with the system profile, Iris uses her own
+  profile instead of killing it; profile cookies and logins therefore differ.
+- SAPI quality depends on the installed Windows voices. Hazel is present on
+  this laptop; another machine falls back to the best British/female voice it
+  has, then to whatever SAPI offers.
+- Autonomy is intentionally conservative: safe reads, navigation, opening
+  things and short spoken lines only. Anything destructive, private or costly
+  still goes through the normal confirmation path.
+- The avatar is plain tkinter, not a 3D character. It is light enough for an
+  8 GB laptop and disappears with the main window.
+
+## 18. Talking over her: loudness barge-in
+
+Iris can now be interrupted simply by speaking over her, in addition to Esc and
+the wake phrase.
+
+- `core/ears.py` adds `BargeIn`, a pure state machine. While `voice` is actually
+  playing it learns the echo baseline from the first ~1 s of each playback burst
+  (median RMS of the mic frames, so a word or two from the user does not move
+  it), then fires when the user is above `max(min_rms, baseline * ratio)` for
+  `hold_s` (~300 ms). It fires once per burst and relearns on the next one.
+- `KeepBuffer` holds the last ~0.6 s of microphone audio. On a trigger the
+  frames are moved into the next listen capture, so the first word the user
+  said is not lost. `Ears._seed_preroll()` restores them after the mode change and
+  the seeded frames count towards the "real speech" threshold.
+- On a trigger: `voice.stop()` cuts the audio, `agent.cancel` cancels the turn,
+  `state` becomes `listening`, and the interface shows a short "Go ahead." cue.
+- `voice.barge_in_mode` is `voice` (default), `wake` (wake phrase only) or `off`
+  (Esc only). The legacy `voice.barge_in` flag still maps to `off` when no mode
+  is set. New knobs: `barge_in_ratio`, `barge_in_min_rms`, `barge_in_learn`,
+  `barge_in_hold`, `barge_in_keep`, `barge_in_debug`.
+- `barge_in_debug: true` prints the learned baseline and threshold, both once
+  per burst and on a trigger.
+- `core/ears.py` now creates the microphone singleton lazily, so the detector
+  can be imported and tested without opening the mic.
+- `tests/test_bargein.py`: 14 tests replaying synthetic frames - steady echo
+  with jitter never triggers, a single spike does not trigger, a user talking
+  over her triggers within 0.4 s, a quiet room uses the absolute floor, modes
+  map correctly, and the kept audio is seeded into the next capture.
+
+## 19. Online voice no longer drops out on a slow line
+
+Iris was speaking in the offline SAPI voice while the internet was fine. The
+cause was the Edge TTS budget: `tts_timeout` was 3.0 s, but this line needs about
+2.2-2.7 s just for the first audio and 3.3 s for a short sentence, so almost
+every request timed out. A timeout then set a 30 s "Edge is down" window and
+showed the "Voice switched to the offline voice" toast, so one slow sentence
+kept her on Hazel.
+
+- `tts_timeout` default is now 6.0 s (config and `core/config.py`), which leaves
+  headroom for a slow line without letting the fallback hang.
+- Timeouts and connection errors are now treated as transient: Edge is skipped
+  for `tts_soft_retry` (12 s) so the rest of the reply keeps one voice, with no
+  toast. Real service refusals still use `edge_retry` (30 s) and toast once.
+- The warning now logs the exception type instead of an empty message, so a
+  timeout is readable in `logs/iris.log`.
+- Startup prewarm waits while a real reply is being synthesised or played. A
+  second concurrent Edge stream roughly doubles the latency, and the greeting
+  matters more than warming the cache.
+- `tests/test_voice.py` checks the bounded budget, that a timeout neither
+  benches Edge for 30 s nor toasts, and that a service refusal still toasts once
+  and recovers when the network returns.
+
+## 20. Persona eval: measure how human she sounds
+
+Tuning the persona by vibes is guesswork. `scripts/persona_eval.py` runs about
+thirty scripted turns through the real `core/persona.py` prompt and the real
+free-model chain, then scores every reply on rules a machine can check. It is
+read-only: it never edits `config.yaml` or `core/persona.py`.
+
+- 31 cases across small talk, a bad day, jokes, errors, commands, 3 a.m. coding
+  and disagreement. Ten are marked `upset`, so the softer-tone rule only applies
+  where it should.
+- Rules: at most three sentences; no markdown, lists, headings, code, links or
+  tables; no helpdesk phrases (a built-in list plus `--helpdesk-file`); no
+  banned opener ("Certainly", "Of course", "I'd be happy to"); the user's name
+  at most once and never Iris in the third person; at most one question mark per
+  reply; an opener repeated for the third time is flagged; and on an upset turn,
+  a warm acknowledgement with no teasing.
+- The scorecard shows per-rule pass/fail, the overall rate, the observed
+  question rate against `persona.curiosity` (a +/-25 point band), repeated
+  openers, and the three worst replies. Each worst reply names the failed
+  checks and the `build_prompt()` sentences likely responsible.
+- `--demo` scores canned replies with no network or model calls, so the
+  scorecard works offline. The live runner uses `brain.ask_stream` with
+  `tools=None`, one turn at a time, a configurable gap, and a rate-limit
+  backoff before retrying a turn that got no reply. It only ever uses
+  `brain.chain()`, which already refuses paid IDs and providers without a key.
+- `--json PATH` writes the same result for comparing runs over time.
+- `tests/test_persona_eval.py`: 23 tests on canned replies covering every
+  scorer, the upset-tone pass/fail cases, repeated openers, prompt blame, the
+  demo scorecard, JSON output and case-set coverage.
+
+## 21. Skills she writes herself, a warmer voice, a human avatar
+
+Iris can now save a multi-step job as a reusable skill, sounds less robotic,
+and appears as a small animated person instead of a glowing orb. Everything is
+still free: Edge TTS, the existing free models and plain tkinter. No new
+service, download or paid tier was added.
+
+### Skills she writes herself
+
+- `core/recipe.py` stores a skill as JSON data, not Python. A recipe lists
+  registered tools and arguments, with `{name}` placeholders for inputs.
+- The new `create_skill` tool is level 2, so the user is asked before anything
+  is saved. Saved recipes live in `data/skills/` and are registered as normal
+  tools at startup.
+- Safety is unchanged at the step level: every step goes through
+  `core.skill.run_tool`, so a level-2 step still asks every time it runs.
+  Recipes cannot call level-3 tools, skill management tools or another recipe,
+  and a step can only use arguments that tool really accepts.
+- `list_skills` shows what she has learned; `forget_skill` (level 2) deletes a
+  saved recipe. A corrupt or invalid file is skipped with a log line instead of
+  breaking startup.
+- `skills.enabled`, `skills.folder`, `skills.max_steps` and `skills.max_recipes`
+  are new settings with defaults in `core/config.py` and comments in
+  `config.yaml`.
+- The persona prompt now tells her when to save a skill and when not to.
+
+### A warmer, more human voice
+
+- The default Edge voice is now `en-US-AvaMultilingualNeural`, the free
+  "Expressive, Caring, Pleasant, Friendly" Copilot voice. The old British
+  `Sonia` voice stays available by changing `voice.tts_voice`.
+- `core/text.py` adds punctuation-aware prosody: questions lift, exclamations
+  brighten, trailing thoughts fall, long sentences slow down and very short
+  ones keep their bounce. The per-phrase jitter is still deterministic, so the
+  TTS cache keeps working.
+- The offline SAPI fallback now prefers the matching American female voice
+  (`Zira`) and uses `en-US` SSML, instead of the old British `Hazel`/`en-GB`.
+- `tests/test_core.py` covers the contour; `tests/test_voice.py` covers the
+  new offline voice preference and SSML language.
+
+### A human avatar
+
+- `interfaces/avatar.py` now draws a stylised woman on the same transparent,
+  always-on-top Toplevel: hair, face, blinking eyes with a moving gaze, brows
+  that react, a mouth that moves with speech, breathing shoulders and a soft
+  halo. It keeps the existing API (`set_state`, `set_level`, `say`, `hide`,
+  `show`, `visible`, `close`) and the same drag/click/double-click/right-click
+  behaviour.
+- States are still `idle`, `listening`, `thinking` and `speaking`. Thinking
+  adds floating dots, listening widens the eyes and raises the brows, speaking
+  opens the mouth and nods slightly.
+- Motion is pure, deterministic and cheap: about 40 canvas items at the same
+  40 ms tick, with no images or extra downloads. The pure helpers are tested in
+  `tests/test_avatar.py` without opening a window.
+
+### A free model chain that survives a limit
+
+- OpenRouter's free tier has a 50-request-per-day cap per account, not per
+  model, so adding more OpenRouter models cannot help once it is hit. When that
+  error arrives the whole provider is now parked until the reset time in the
+  `X-RateLimit-Reset` header, and the other free providers keep answering.
+- Groq's free limits are per model. Every free Groq chat model is discovered
+  from the models endpoint (cached for an hour) and tried in turn, so one
+  model's tokens-per-minute running out no longer disables the rest. A static
+  `models.groq_models` list can pin an exact order.
+- A rate-limited model is cooled on its own (`cool_model`) instead of tripping
+  the provider breaker. The breaker is only used for real outages and
+  account-wide limits.
+- The full tool list is about 9k tokens, which is larger than Groq's per-minute
+  input budget, so a Groq request used to fail with HTTP 413 and no reply.
+  `core.skill.select_tools` now keeps a small core set plus the tools that match
+  the user's words inside `brain.groq_tool_budget` (4000 rough tokens). A 413
+  still shrinks the list once and retries the same model before moving on.
+- New settings with defaults in `core/config.py` and comments in `config.yaml`:
+  `models.groq_free`, `models.groq_models`, `models.groq_max`,
+  `models.openrouter_max` (now 10) and `brain.groq_tool_budget`.
+- `tests/test_resilience.py` covers the daily cap, a per-model limit, the cooled
+  model being skipped and the 413 shrink-and-retry; `tests/test_core.py` covers
+  the tool budget selection.
+
+## 22. The voice stopped dropping out, and she speaks like a person
+
+### The real cause (measured, not guessed)
+
+`scripts/voice_diag.py` synthesises five sentences with the configured voice and
+prints the exact exception, the time to first audio, the prosody strings, the
+voice-list check and the DNS/TCP timings. On this laptop it showed:
+
+- the voice name was present, DNS took about 0.06 s, TCP connect about 0.6 s,
+  and every rate/pitch string was valid;
+- Edge itself was variable: warm sentences produced audio in 0.7-2.5 s, but a
+  cold or busy one needed 5-7.7 s;
+- the old code wrapped the whole `save()` in one 6 s `asyncio.wait_for`, so a
+  normal cold sentence hit `TimeoutError` at exactly 6.01 s;
+- one timeout immediately set the old `_EDGE_DOWN` flag, which sent the rest of
+  the reply to the Windows voice for 12 s. That is the voice switch the user
+  heard.
+
+With `--timeout 15` all five sentences succeeded, confirming the service was
+fine and the budget was not.
+
+### Fallback that treats one hiccup as a hiccup
+
+- `core.voice.EdgeHealth` is a pure state machine with an injectable clock. A
+  failed sentence is recorded once (after its own retries); Edge is marked down
+  only after `voice.edge_down_after` (3) failures inside
+  `voice.edge_down_window` (60 s). One failure never switches the next sentence.
+- Each sentence gets `voice.edge_retries` (2) extra attempts with 0.4 s/0.8 s
+  backoff, inside `voice.edge_total_budget` (20 s). The websocket uses
+  `edge_connect_timeout` (6 s) and a first-audio budget of 8 s cold / 5 s warm.
+  Once audio is flowing the stream is allowed to finish, so a long merged reply
+  is never cut off by the sentence budget.
+- A failed sentence is spoken by the offline voice immediately, but the next
+  sentence tries Edge again unless the state machine is really down.
+- While down, a background thread probes a tiny "Okay." every
+  `voice.edge_probe_interval` (20 s), never during a reply, and the first
+  success clears the state. A connectivity recovery also brings the probe
+  forward.
+- Toasts fire only on the transition ("Voice switched to the offline voice." /
+  "Voice back online."). Every attempt logs its exception type and message.
+- New settings: `voice.engine` (`auto | edge | offline`), `edge_retries`,
+  `edge_connect_timeout`, `edge_first_audio_cold`, `edge_first_audio_warm`,
+  `edge_total_budget`, `edge_cold_after`, `edge_down_after`,
+  `edge_down_window`, `edge_probe_interval`. The old `tts_timeout`, `edge_retry`
+  and `tts_soft_retry` keys are gone.
+
+### Spoken text, not written text
+
+- `core.text.speakable()` is applied inside the speech pipeline, so every line
+  is normalised while the UI keeps the original reply. It strips markdown,
+  emoji/emoticons, URLs, code fences and long Windows/POSIX paths, expands
+  abbreviations, and turns times, dates, percentages, currency, units and
+  numbers into words ("9:30" -> "nine thirty", "20%" -> "twenty percent",
+  "2026-11-18" -> "November eighteenth, twenty twenty-six").
+- Ellipses become a short pause and a sentence longer than 25 words is split at
+  its middle comma, repeatedly, so the voice can breathe.
+- `voice.pronunciations` is a config map applied last (`SQL` -> `sequel`,
+  `JSON` -> `jason`, and so on). `voice.speakable: false` turns the whole step
+  off.
+
+### A natural rhythm, with valid strings
+
+- `core.text.prosody()` still returns the same deterministic variation for the
+  same phrase (so the cache still hits), but now always emits `+N%` and `+NHz`.
+  A garbage config value such as `+-1Hz` is parsed and clamped instead of being
+  sent to Edge.
+- Questions lift and slow slightly, exclamations brighten, trailing thoughts
+  fall, long sentences slow down and very short reactions get a little quicker.
+- `voice.style` is `calm`, `warm` (default) or `energetic`, each clamping rate
+  and pitch to a sensible range; the base rate is now `+2%`, so the default
+  result stays inside +0%..+5%.
+
+### Audition the free voices
+
+- `scripts/voice_audition.py` generates the same six lines (casual, joke,
+  question, serious, long explanation, time and number) in all eight requested
+  Edge voices, into `data/voice_audition/<voice>/`, then opens the folder.
+  Missing voices are skipped, existing files are reused, `--force` redoes them.
+  It does not choose for the user; Ava stays the default.
+- `scripts/voice_diag.py` remains the first thing to run when the voice drops.
+
+### Optional Kokoro offline voice (opt-in, never required)
+
+- `core/kokoro.py` uses `kokoro-onnx` with `models/kokoro-v1.0.int8.onnx` and
+  `models/voices-v1.0.bin`. It is imported lazily in the TTS worker thread and
+  only when `voice.offline_engine: kokoro`.
+- On first use it measures the real-time factor and refuses the model if it is
+  slower than `voice.kokoro_max_rtf` (1.5x), logging why and using SAPI. Any
+  missing package, missing file, bad sample rate or synthesis error also falls
+  back to SAPI; nothing else breaks.
+- `scripts/fetch_kokoro.py` downloads the two files once, resumably, into
+  `models/`; `--check` reports what is present. Then install
+  `kokoro-onnx` with pip. This is optional and needs no account or payment.
+- Kokoro plays through pygame, so `stop()` still cuts it off within the 50 ms
+  barge-in budget, and the Edge mp3 cache is unchanged.
+
+### Tests
+
+- `tests/test_voice.py` drives `EdgeHealth` with a fake clock (one failure does
+  not switch, three do, old failures expire, recovery toasts once, probe
+  timing), checks per-sentence fallback in the pipeline, the once-only toast,
+  the forced engines, the Kokoro fallback and the spoken-text normalisation.
+- `tests/test_core.py` covers `speakable()` (numbers, times, dates, units,
+  currency, URLs, paths, markdown, emoji, abbreviations, ellipses, long
+  sentences) and a property test over hundreds of random phrases asserting
+  every generated rate/pitch matches `^[+-]\d+%$` and `^[+-]\d+Hz$`, including
+  inside every style.
+
